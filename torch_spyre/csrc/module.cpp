@@ -145,7 +145,6 @@ static void init_from_env() {
 }
 
 void _startRuntime() {
-  std::cerr << "Test1" << std::endl;
   DEBUGINFO("starting runtime");
   // Determine logical device index with priority:
   //   1. tls_idx (non-zero) — set via explicit set_device() call
