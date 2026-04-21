@@ -76,11 +76,11 @@ static const char *get_timing_log_path() {
 std::atomic<bool> g_downcast_warn_enabled{true};
 
 bool get_downcast_warn_enabled() {
-  return g_downcast_warn_enabled.load();
+  return g_downcast_warn_enabled.load(std::memory_order_relaxed);
 }
 
 void set_downcast_warn_enabled(bool enabled) {
-  g_downcast_warn_enabled.store(enabled);
+  g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 // Helper function to write timing log
@@ -110,7 +110,7 @@ static void init_from_env() {
     std::string s(v);
     for (auto &c : s) c = std::tolower(c);
     bool enable = !(s == "0" || s == "false" || s == "off");
-    g_downcast_warn_enabled.store(enable);
+    g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
   }
 
   // Initialize timing control (check once at startup)
