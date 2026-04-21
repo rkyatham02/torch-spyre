@@ -329,7 +329,6 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                           ->owner);
   sen_outputs.push_back(tensor);
 
-  // Execute device init (part of preparation)
   status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
   if (!status.IsOk()) throw std::runtime_error(status.Message());
 
