@@ -23,9 +23,13 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <chrono>   // std::chrono for timing
 #include <cstdlib>  // std::getenv
 #include <flex/compiler_interface/dee_graph_converter.hpp>
 #include <flex/runtime_graph/flex_factory.hpp>
+#include <fstream>   // std::ofstream for log file
+#include <iomanip>   // std::put_time
+#include <iostream>  // std::cerr
 #include <memory>
 #include <sendnn/graph.hpp>
 #include <sendnn/graph/graph_builder.hpp>
@@ -52,14 +56,51 @@ namespace spyre {
 
 static constexpr int32_t kSpyreTensorLayoutPickleVersion = 2;
 
+// Environment variable names for timing control
+static constexpr const char *SPYRE_TIME_LAUNCHKERNEL_ENV =
+    "SPYRE_TIME_LAUNCHKERNEL";
+static constexpr const char *SPYRE_TIMING_LOG_ENV = "SPYRE_TIMING_LOG";
+
+// Global timing control flag (initialized once at startup)
+static std::atomic<bool> g_timing_enabled{false};
+
+// Helper function to get timing log path (avoids static string variable)
+static const char *get_timing_log_path() {
+  static const char *cached_path = nullptr;
+  static std::once_flag init_flag;
+  std::call_once(init_flag,
+                 []() { cached_path = std::getenv(SPYRE_TIMING_LOG_ENV); });
+  return cached_path;
+}
+
 std::atomic<bool> g_downcast_warn_enabled{true};
 
 bool get_downcast_warn_enabled() {
-  return g_downcast_warn_enabled.load(std::memory_order_relaxed);
+  return g_downcast_warn_enabled.load();
 }
 
 void set_downcast_warn_enabled(bool enabled) {
-  g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
+  g_downcast_warn_enabled.store(enabled);
+}
+
+// Helper function to write timing log
+static void write_timing_log(const std::string &message) {
+  const char *log_path = get_timing_log_path();
+  if (log_path == nullptr || log_path[0] == '\0') {
+    // Write to stderr
+    std::cerr << message << std::endl;
+  } else {
+    // Write to file
+    std::ofstream log_file(log_path, std::ios::app);
+    if (log_file.is_open()) {
+      log_file << message << std::endl;
+    } else {
+      // Fallback to stderr if file can't be opened
+      std::cerr << "[SPYRE_TIMING] Failed to open log file: " << log_path
+                << std::endl;
+      std::cerr << message << std::endl;
+    }
+  }
 }
 
 // Optional: initialize from env at module init
@@ -69,7 +110,27 @@ static void init_from_env() {
     std::string s(v);
     for (auto &c : s) c = std::tolower(c);
     bool enable = !(s == "0" || s == "false" || s == "off");
-    g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
+    g_downcast_warn_enabled.store(enable);
+  }
+
+  // Initialize timing control (check once at startup)
+  if (const char *timing_env = std::getenv(SPYRE_TIME_LAUNCHKERNEL_ENV)) {
+    std::string s(timing_env);
+    for (auto &c : s) c = std::tolower(c);
+    bool enable = !(s == "0" || s == "false" || s == "off");
+    g_timing_enabled.store(enable);
+
+    if (enable) {
+      // Log initialization message
+      const char *log_path = get_timing_log_path();
+      std::string init_msg = "[SPYRE_TIMING] Timing enabled for LaunchKernel";
+      if (log_path != nullptr && log_path[0] != '\0') {
+        init_msg += " (logging to: ";
+        init_msg += log_path;
+        init_msg += ")";
+      }
+      write_timing_log(init_msg);
+    }
   }
 }
 
@@ -119,12 +180,56 @@ void freeRuntime() {
   GlobalRuntime::reset();
 }
 void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
+  // Timing infrastructure
+  using Clock = std::chrono::high_resolution_clock;
+  using TimePoint = std::chrono::time_point<Clock>;
+  using Duration = std::chrono::duration<double, std::micro>;  // microseconds
+
+  const bool timing_enabled = g_timing_enabled.load();
+  TimePoint total_start, phase_start;
+
+  if (timing_enabled) {
+    total_start = Clock::now();
+
+    // Get current timestamp for correlation
+    auto now = std::chrono::system_clock::now();
+    auto now_time_t = std::chrono::system_clock::to_time_t(now);
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now.time_since_epoch()) %
+                  1000;
+
+    std::ostringstream timestamp_stream;
+    timestamp_stream << std::put_time(std::localtime(&now_time_t),
+                                      "%Y-%m-%d %H:%M:%S")
+                     << '.' << std::setfill('0') << std::setw(3)
+                     << now_ms.count();
+
+    write_timing_log("[SPYRE_TIMING] ========================================");
+    write_timing_log("[SPYRE_TIMING] LaunchKernel started at: " +
+                     timestamp_stream.str());
+    write_timing_log("[SPYRE_TIMING] Graph path: " + g2_path);
+  }
+
   // Get global runtime from eager
   auto gl = sendnn::GraphLoader(GlobalRuntime::get());
+
+  // Phase 1: Deserialization - START TIMER BEFORE
+  if (timing_enabled) {
+    phase_start = Clock::now();
+  }
 
   // Load compiled kernel
   auto g2 = sendnn::Graph();
   sendnn::Deserialize(&g2, g2_path);
+
+  if (timing_enabled) {
+    auto phase_duration =
+        std::chrono::duration_cast<Duration>(Clock::now() - phase_start);
+    std::ostringstream msg;
+    msg << "[SPYRE_TIMING] Phase: Deserialization | Duration: " << std::fixed
+        << std::setprecision(3) << phase_duration.count() << " μs";
+    write_timing_log(msg.str());
+  }
 
   for (auto &super_node : g2.compute_ops_) {
     if (super_node->Name() != "DeviceInit" &&
@@ -169,6 +274,12 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     }
   }
 
+  // Phase 2: Preparation - START TIMER BEFORE (LoadGraph + CompileGraph +
+  // ParseGraph + tensor creation)
+  if (timing_enabled) {
+    phase_start = Clock::now();
+  }
+
   // Load/parse patched G2 graph
   auto status = gl.LoadGraph(g2, false);
   if (!status.IsOk()) throw std::runtime_error(status.Message());
@@ -208,12 +319,44 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                           ->owner);
   sen_outputs.push_back(tensor);
 
+  if (timing_enabled) {
+    auto phase_duration =
+        std::chrono::duration_cast<Duration>(Clock::now() - phase_start);
+    std::ostringstream msg;
+    msg << "[SPYRE_TIMING] Phase: Preparation | Duration: " << std::fixed
+        << std::setprecision(3) << phase_duration.count() << " μs";
+    write_timing_log(msg.str());
+  }
+
+  // Phase 3: Compute - START TIMER BEFORE (device init + actual computation)
+  if (timing_enabled) {
+    phase_start = Clock::now();
+  }
+
   // Execute device init
   status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
   if (!status.IsOk()) throw std::runtime_error(status.Message());
 
   status = gl.Compute(sen_outputs, sen_inputs, 1);
   if (!status.IsOk()) throw std::runtime_error(status.Message());
+
+  if (timing_enabled) {
+    auto phase_duration =
+        std::chrono::duration_cast<Duration>(Clock::now() - phase_start);
+    std::ostringstream msg;
+    msg << "[SPYRE_TIMING] Phase: Compute | Duration: " << std::fixed
+        << std::setprecision(3) << phase_duration.count() << " μs";
+    write_timing_log(msg.str());
+
+    // Total time
+    auto total_duration =
+        std::chrono::duration_cast<Duration>(Clock::now() - total_start);
+    std::ostringstream total_msg;
+    total_msg << "[SPYRE_TIMING] Total LaunchKernel Duration: " << std::fixed
+              << std::setprecision(3) << total_duration.count() << " μs";
+    write_timing_log(total_msg.str());
+    write_timing_log("[SPYRE_TIMING] ========================================");
+  }
 
   return;
 }
