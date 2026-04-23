@@ -19,6 +19,44 @@ import math
 import sympy
 from typing import Optional, Sequence, Dict, Tuple
 
+from torch._inductor.virtualized import V
+
+
+# NOTE: this is intentionally a local copy of pass_utils.concretize_expr.
+# views.py cannot import from pass_utils because pass_utils imports
+# compute_coordinates from views (circular dependency).  The duplication
+# is acceptable because both are thin wrappers around V.graph.sizevars.size_hint.
+def _concretize_for_cmp(expr):
+    """Return a concrete numeric value for use in comparison operators only.
+
+    Used for branching decisions inside ``compute_coordinates`` and
+    ``align_tensors`` (e.g. choosing which dimension a loop variable maps to).
+    The coordinate *output* expressions stay symbolic.
+
+    Returns a Python ``int`` for ordinary values, and ``math.inf`` /
+    ``-math.inf`` for sympy infinities (used as ``limit=sympy.oo`` sentinels
+    in ``add_term`` when the index has a non-zero storage offset, e.g. for
+    slice / split ops).  ``int(sympy.oo)`` would raise; ``math.inf`` works
+    correctly in ``<`` / ``>`` comparisons against ints and sympy values.
+
+    TODO(issue#1373): once these algorithms use sympy predicates or
+    SizeVarAllocator guards, this function can be removed.
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    # sympy.oo / -sympy.oo cannot be cast to int; preserve as Python infinity.
+    if expr == sympy.oo:
+        return math.inf
+    if expr == -sympy.oo:
+        return -math.inf
+    if isinstance(expr, float):
+        return expr  # passthrough (incl. math.inf); avoids int(math.inf) error
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        return V.graph.sizevars.size_hint(expr)
+    return int(expr)
+
 
 def compute_coordinates(
     size: Sequence[sympy.Expr],
@@ -31,7 +69,19 @@ def compute_coordinates(
 
     Stride and index must be relative to the same storage (both host or device).
     Stride values<=0 are ignored.
+
+    ``size`` and ``stride`` must be concrete (int) values—callers such as
+    ``host_coordinates`` concretize them before calling.  ``var_ranges``
+    may contain symbolic expressions (e.g. a dynamic batch dimension); the
+    algorithm concretizes range values only for comparison logic, while the
+    output coordinate expressions remain symbolic.
     """
+    assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
+        f"compute_coordinates requires concrete strides, got {stride}"
+    )
+    assert all(isinstance(s, (int, sympy.Integer)) for s in size), (
+        f"compute_coordinates requires concrete sizes, got {size}"
+    )
     # find stride immediately strictly larger that dim stride
     n = len(size)
     next_stride = [sympy.oo] * n
@@ -44,6 +94,13 @@ def compute_coordinates(
     coordinates = [sympy.S.Zero] * n
 
     def add_term(var, step, limit):
+        # Concretize step and limit for comparison logic only.  The symbolic
+        # ``step`` and ``limit`` are still used in the coordinate *output*
+        # expressions (``var * step // st``), preserving symbolic output.
+        # TODO(issue#1373): replace with sympy predicates to avoid concretization.
+        concrete_step = _concretize_for_cmp(step)
+        concrete_limit = _concretize_for_cmp(limit)
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
@@ -51,25 +108,26 @@ def compute_coordinates(
             if size[dim] == 1:
                 continue  # ignore dim with size 1
             st = stride[dim]
-            if st <= step and st > primary_stride:
+            if st <= concrete_step and st > primary_stride:
                 # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
-            elif st > step and st < limit:
+            elif st > concrete_step and st < concrete_limit:
                 # var range intersects dim, add term
-                if next_stride[dim] < limit:
+                if next_stride[dim] < concrete_limit:
                     # var range overflows dim
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
         # add term for primary dim
-        if next_stride[primary_dim] < limit:
-            coordinates[primary_dim] += (
-                # var range overflows primary dim
-                var * step % next_stride[primary_dim] // primary_stride
-            )
-        else:
-            coordinates[primary_dim] += var * step // primary_stride
+        if primary_stride > 0:
+            if next_stride[primary_dim] < concrete_limit:
+                coordinates[primary_dim] += (
+                    # var range overflows primary dim
+                    var * step % next_stride[primary_dim] // primary_stride
+                )
+            else:
+                coordinates[primary_dim] += var * step // primary_stride
 
     vars = index.free_symbols
     offset = index.xreplace({v: 0 for v in vars})
@@ -78,13 +136,24 @@ def compute_coordinates(
         add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
     for var in vars:
-        if var_ranges[var] <= 1:
-            continue  # ignore var with trivial range
+        # Skip symbols that are not loop variables (e.g. size symbols
+        # injected by dynamic shapes that appear in the index expression
+        # but are not iteration variables).
+        if var not in var_ranges:
+            continue
+
+        range_val = var_ranges[var]
+
+        # Skip vars with trivial range.  For symbolic ranges we cannot
+        # statically determine triviality, so we assume they are non-trivial.
+        if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
+            continue
+
         # isolate current var
         term = index.xreplace({v: 0 for v in vars - {var}})
         # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.xreplace({var: 1})
-        limit = term.xreplace({var: var_ranges[var]})
+        limit = term.xreplace({var: range_val})
         add_term(var=var, step=step, limit=limit)
 
     return coordinates
@@ -136,7 +205,7 @@ class Term:
     """
     A term num*(var%mod)//den + offset in a coordinate expression.
     Includes the size of the dimension the expression is intended for.
-    Zero is represented as Term(None, None, None, None, dim_size, 0).
+    Constant including zero is represented as Term(None, None, None, None, dim_size, offset).
     """
 
     num: sympy.Expr | None  # numerator
@@ -174,9 +243,7 @@ def normalize_coordinates(
         vars = expr.free_symbols
         offset = expr.xreplace({var: sympy.S.Zero for var in vars})
         if len(vars) == 0:
-            # TODO: Support size-1 dimensions with non-zero offset
-            assert offset == 0
-            terms.append(Term(None, None, None, None, dim_size))
+            terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         dim_terms = []  # terms for current dimension
         for var in vars:
@@ -249,10 +316,10 @@ def normalize_coordinates(
             fused_term.dim_size *= term.dim_size
             fused_term.offset += term.offset
         else:
-            if fused_term.dim_size > 1:
+            if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
             fused_term = term
-    if fused_term.dim_size > 1:
+    if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
     # add term for stick dimension
     fused_terms.append(terms[-1])
@@ -262,15 +329,24 @@ def normalize_coordinates(
 
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
-    tensors: Sequence[Dict[str, Sequence[sympy.Expr]]],
+    tensors: list[Dict[str, list[sympy.Expr]]],
 ) -> tuple[
     (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
 ]:
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
     """
-    # range for each variable
-    var_ranges = {var: val[0] for var, val in iteration_space.items()}
+
+    # Concretize range values for the algorithm: align_tensors performs
+    # sorting, math.gcd, and integer division that require concrete ints.
+    # Coordinate *expressions* remain symbolic (they reference loop variable
+    # Symbols, not range values).
+    # TODO(issue#1373): make align_tensors symbolic-aware so concretization can
+    #              be removed.
+
+    var_ranges = {
+        var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()
+    }
 
     # core division for each variable
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
@@ -282,6 +358,35 @@ def align_tensors(
     all_terms = []  # terms for each tensor
     stick_dim = []  # stick var for each tensor
     stick_size = []  # stick size for each tensor
+
+    n = 0  # next symbol number
+
+    # TODO: Current support of size-1 dimensions are limited. We will generalize this
+    # in follow-up PRs. See #1548
+    is_pointwise_op = len(set([len(tensor["size"]) for tensor in tensors])) == 1
+    if is_pointwise_op:
+        rank = len(tensors[0]["size"])
+        vars = var_ranges.keys()
+        for i in range(rank):
+            coords = [tensor["coordinates"][i] for tensor in tensors]
+            if all(c == 0 for c in coords):
+                continue
+            if not any(c == 0 for c in coords):
+                continue
+            if not any(c.is_number and c > 0 for c in coords):
+                continue
+
+            new_var = sympy.symbols(f"z{n}")
+            n += 1
+            var_ranges[new_var] = 1
+            splits[new_var] = set()
+
+            for tensor in tensors:
+                coord = tensor["coordinates"][i]
+                if coord == 0:
+                    tensor["coordinates"][i] = new_var
+                else:
+                    tensor["coordinates"][i] = new_var + coord
 
     for tensor in tensors:
         terms = normalize_coordinates(var_ranges, tensor["size"], tensor["coordinates"])
@@ -304,7 +409,6 @@ def align_tensors(
     # with one var per segment (split[i], split[i+1])
     new_var_ranges = {}
     new_op_it_space_splits = {}
-    n = 0  # next symbol number
     remap = {}  # map old var to new vars in splits order
     for var, split in splits.items():
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
@@ -351,7 +455,11 @@ def align_tensors(
                 and den not in splits[var]
                 else splits[var].index(den)
             )  # replace split[var].index(stick_size) with 0 for stick dim
-            for i in reversed(range(low, splits[var].index(mod))):
+            high = splits[var].index(mod)
+            if low == high:
+                size.append(dim_size)
+                coordinates.append(var + offset)
+            for i in reversed(range(low, high)):
                 if i == splits[var].index(mod) - 1:
                     # upper bound of iteration range is dim_size * den
                     size.append(dim_size * den // splits[var][i])
