@@ -293,6 +293,26 @@ class TestSpyre(TestCase):
                 x = torch.empty(64, dtype=dtype)
                 x.to("spyre")
 
+    def test_device_to_device_copy(self):
+        # Test device-to-device copy using copy_() method
+        x = torch.ones(3, dtype=torch.float16, device="spyre")
+        y = torch.empty(3, dtype=torch.float16, device="spyre")
+        y.copy_(x)
+
+        # Check that values are the same by comparing on CPU
+        self.assertTrue(torch.all(x.cpu() == y.cpu()))
+        self.assertTrue(torch.all(y.cpu() == 1.0))
+
+        # Test with different values
+        z = torch.tensor([1.5, 2.5, 3.5], dtype=torch.float16, device="spyre")
+        y.copy_(z)
+
+        # Check that values are the same by comparing on CPU
+        self.assertTrue(torch.all(y.cpu() == z.cpu()))
+        self.assertTrue(
+            torch.all(y.cpu() == torch.tensor([1.5, 2.5, 3.5], dtype=torch.float16))
+        )
+
     def test_detach(self):
         # exercises the shallow copy code path
         for dtype in [torch.float16, torch.float32, torch.bool, torch.int8]:
@@ -385,6 +405,26 @@ class TestSpyre(TestCase):
         # The generated class should be instantiable (valid MRO)
         cls = ns["_TestMROCheckPRIVATEUSE1"]
         assert issubclass(cls, TestCase)
+
+    def test_device_to_device(self):
+        """Test simple device-to-device copy using tensor.copy_() method."""
+        src = torch.randn(3, dtype=torch.float16, device="spyre")
+        dst = torch.empty(3, dtype=torch.float16, device="spyre")
+
+        dst.copy_(src)
+
+        # Verify the copy worked
+        assert torch.allclose(src.cpu(), dst.cpu())
+        assert src.data_ptr() != dst.data_ptr()
+
+    def test_device_to_device_with_view(self):
+        """Test more complex device-to-device copy using tensor.copy_() method."""
+        a = torch.randn(512, 512).to("spyre")
+        b = torch.zeros((512, 512), device="spyre")
+        c = b.view((64, 8, 512))
+        b.copy_(a)
+        assert torch.allclose(a.cpu(), b.cpu())
+        assert torch.allclose(a.cpu().view(64, 8, 512), c.cpu())
 
 
 if __name__ == "__main__":
