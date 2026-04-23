@@ -215,7 +215,7 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                      << now_ms.count();
 
     write_timing_log("[SPYRE_TIMING] ========================================");
-    write_timing_log("[SPYRE_TIMING] LaunchKernel started at: " +
+    write_timing_log("[SPYRE_TIMING] LaunchKernel started at: TESTING RIGHT " +
                      timestamp_stream.str());
     write_timing_log("[SPYRE_TIMING] Graph path: " + g2_path);
   }
