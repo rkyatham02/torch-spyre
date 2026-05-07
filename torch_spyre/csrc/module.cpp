@@ -408,4 +408,71 @@ PYBIND11_MODULE(_C, m) {
         .index();
   });
   m.def("device_count", &spyre::device_count);
+
+  // Allocator statistics functions
+  m.def(
+      "_spyre_get_allocator_stats",
+      [](c10::DeviceIndex device) {
+        auto &allocator = spyre::SpyreAllocator::instance();
+        auto stats = allocator.getDeviceStats(device);
+        py::dict result;
+        result["allocated_bytes.all.current"] =
+            stats
+                .allocated_bytes[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .current;
+        result["allocated_bytes.all.peak"] =
+            stats
+                .allocated_bytes[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .peak;
+        result["allocated_bytes.all.allocated"] =
+            stats
+                .allocated_bytes[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .allocated;
+        result["allocated_bytes.all.freed"] =
+            stats
+                .allocated_bytes[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .freed;
+        result["allocation.all.current"] =
+            stats
+                .allocation[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .current;
+        result["allocation.all.peak"] =
+            stats
+                .allocation[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .peak;
+        result["allocation.all.allocated"] =
+            stats
+                .allocation[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .allocated;
+        result["allocation.all.freed"] =
+            stats
+                .allocation[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .freed;
+        return result;
+      },
+      py::arg("device"), "Get allocator statistics for a device");
+
+  m.def(
+      "_spyre_reset_accumulated_stats",
+      [](c10::DeviceIndex device) {
+        auto &allocator = spyre::SpyreAllocator::instance();
+        allocator.resetAccumulatedStats(device);
+      },
+      py::arg("device"), "Reset accumulated allocator statistics");
+
+  m.def(
+      "_spyre_reset_peak_stats",
+      [](c10::DeviceIndex device) {
+        auto &allocator = spyre::SpyreAllocator::instance();
+        allocator.resetPeakStats(device);
+      },
+      py::arg("device"), "Reset peak allocator statistics");
 }
