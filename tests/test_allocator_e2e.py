@@ -30,7 +30,10 @@ from torch.testing._internal.common_utils import (
 
 def get_allocator_stats():
     """Get current allocator statistics from SpyreAllocator."""
-    stats = torch.spyre._C._spyre_get_allocator_stats(0)
+    # Ensure torch.spyre is initialized
+    if not torch.spyre.is_initialized():
+        torch.spyre._lazy_init()
+    stats = torch.spyre._spyre_get_allocator_stats(0)
     return {
         "allocated_bytes": stats.get("allocated_bytes.all.current", 0),
         "num_allocs": stats.get("allocation.all.current", 0),
@@ -46,8 +49,11 @@ class TestAllocatorE2E(TestCase):
         super().setUp()
         # Force garbage collection to ensure clean state
         gc.collect()
-        torch.spyre._C._spyre_reset_accumulated_stats(0)
-        torch.spyre._C._spyre_reset_peak_stats(0)
+        # Ensure torch.spyre is initialized
+        if not torch.spyre.is_initialized():
+            torch.spyre._lazy_init()
+        torch.spyre._spyre_reset_accumulated_stats(0)
+        torch.spyre._spyre_reset_peak_stats(0)
 
     def tearDown(self):
         """Clean up after each test."""
