@@ -112,7 +112,7 @@ class TestAllocatorE2E(TestCase):
         initial_stats = get_allocator_stats()
 
         # Allocate tensor in a scope
-        torch.empty((N,), device="spyre", dtype=torch.float32)
+        tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
 
         # Verify allocation happened
         stats_during = get_allocator_stats()
@@ -121,7 +121,8 @@ class TestAllocatorE2E(TestCase):
         )
         self.assertGreater(stats_during["num_allocs"], initial_stats["num_allocs"])
 
-        # Force garbage collection to trigger ReportAndDelete
+        # Delete tensor reference and force garbage collection to trigger ReportAndDelete
+        del tensor
         gc.collect()
 
         # Verify deallocation happened
