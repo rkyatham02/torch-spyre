@@ -138,65 +138,53 @@ class TestAllocatorE2E(TestCase):
             "Allocation count should return to initial value",
         )
 
-    # def test_explicit_deletion(self):
-    #     """
-    #     Test 2b: Explicit deletion with del
-    #     Verify that explicitly deleting a tensor triggers deallocation.
-    #     """
-    #     N = 1024
+    def test_sequential_alloc_free_cycles(self):
+        """
+        Test 3: Sequential alloc/free
+        Allocate and free 100 tensors of the same size sequentially,
+        verify allocator state is clean (no leaked blocks, free space matches initial).
+        """
+        N = 512
+        num_cycles = 100
 
-    #     initial_stats = get_allocator_stats()
+        initial_stats = get_allocator_stats()
 
-    #     # Allocate tensor
-    #     tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
-    #     stats_after_alloc = get_allocator_stats()
-    #     self.assertGreater(stats_after_alloc['allocated_bytes'], initial_stats['allocated_bytes'])
+        for i in range(num_cycles):
+            # Allocate tensor
+            tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
 
-    #     # Explicitly delete tensor
-    #     del tensor
-    #     gc.collect()
+            # Verify allocation
+            self.assertGreater(tensor.data_ptr(), 0)
 
-    #     # Verify deallocation
-    #     final_stats = get_allocator_stats()
-    #     self.assertEqual(final_stats['allocated_bytes'], initial_stats['allocated_bytes'],
-    #                     "Memory should be freed after explicit deletion")
+            # Delete tensor
+            del tensor
+            gc.collect()
 
-    # def test_sequential_alloc_free_cycles(self):
-    #     """
-    #     Test 3: Sequential alloc/free
-    #     Allocate and free 100 tensors of the same size sequentially,
-    #     verify allocator state is clean (no leaked blocks, free space matches initial).
-    #     """
-    #     N = 512
-    #     num_cycles = 100
+            # Verify deallocation after each cycle
+            current_stats = get_allocator_stats()
+            self.assertEqual(
+                current_stats["allocated_bytes"],
+                initial_stats["allocated_bytes"],
+                f"Memory leak detected at cycle {i + 1}",
+            )
+            self.assertEqual(
+                current_stats["num_allocs"],
+                initial_stats["num_allocs"],
+                f"Allocation count mismatch at cycle {i + 1}",
+            )
 
-    #     initial_stats = get_allocator_stats()
-
-    #     for i in range(num_cycles):
-    #         # Allocate tensor
-    #         tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
-
-    #         # Verify allocation
-    #         self.assertIsNotNone(tensor.data_ptr())
-    #         self.assertGreater(tensor.data_ptr(), 0)
-
-    #         # Delete tensor
-    #         del tensor
-    #         gc.collect()
-
-    #         # Verify deallocation after each cycle
-    #         current_stats = get_allocator_stats()
-    #         self.assertEqual(current_stats['allocated_bytes'], initial_stats['allocated_bytes'],
-    #                        f"Memory leak detected at cycle {i+1}")
-    #         self.assertEqual(current_stats['num_allocs'], initial_stats['num_allocs'],
-    #                        f"Allocation count mismatch at cycle {i+1}")
-
-    #     # Final verification
-    #     final_stats = get_allocator_stats()
-    #     self.assertEqual(final_stats['allocated_bytes'], initial_stats['allocated_bytes'],
-    #                     "Memory leaked after 100 sequential alloc/free cycles")
-    #     self.assertEqual(final_stats['num_allocs'], initial_stats['num_allocs'],
-    #                     "Allocation count leaked after 100 sequential alloc/free cycles")
+        # Final verification
+        final_stats = get_allocator_stats()
+        self.assertEqual(
+            final_stats["allocated_bytes"],
+            initial_stats["allocated_bytes"],
+            "Memory leaked after 100 sequential alloc/free cycles",
+        )
+        self.assertEqual(
+            final_stats["num_allocs"],
+            initial_stats["num_allocs"],
+            "Allocation count leaked after 100 sequential alloc/free cycles",
+        )
 
     # def test_varying_sizes_random_order(self):
     #     """
