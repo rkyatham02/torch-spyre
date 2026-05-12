@@ -22,6 +22,8 @@ allocate/free cycles leave the allocator in a consistent state.
 
 import gc
 import torch
+import random
+
 from torch.testing._internal.common_utils import (
     TestCase,
     instantiate_parametrized_tests,
@@ -186,54 +188,60 @@ class TestAllocatorE2E(TestCase):
             "Allocation count leaked after 100 sequential alloc/free cycles",
         )
 
-    # def test_varying_sizes_random_order(self):
-    #     """
-    #     Test 4: Varying sizes
-    #     Allocate tensors of different sizes (small, medium, large),
-    #     free in random order, verify consistent state.
-    #     """
-    #     # Define test sizes: small, medium, large
-    #     sizes = [
-    #         128,      # small: 512 bytes
-    #         4096,     # medium: 16 KB
-    #         262144,   # large: 1 MB
-    #         128,      # small again
-    #         8192,     # medium-large: 32 KB
-    #         524288,   # very large: 2 MB
-    #     ]
+    def test_varying_sizes_random_order(self):
+        """
+        Test 4: Varying sizes
+        Allocate tensors of different sizes (small, medium, large),
+        free in random order, verify consistent state.
+        """
 
-    #     initial_stats = get_allocator_stats()
+        sizes = [
+            128,  # small: 512 bytes
+            4096,  # medium: 16 KB
+            262144,  # large: 1 MB
+            128,  # small
+            8192,  # medium-large: 32 KB
+            524288,  # very large: 2 MB
+        ]
 
-    #     # Allocate all tensors
-    #     tensors = []
-    #     for size in sizes:
-    #         tensor = torch.empty((size,), device="spyre", dtype=torch.float32)
-    #         self.assertIsNotNone(tensor.data_ptr())
-    #         tensors.append(tensor)
+        initial_stats = get_allocator_stats()
 
-    #     # Verify all allocations happened
-    #     stats_after_alloc = get_allocator_stats()
-    #     self.assertGreater(stats_after_alloc['allocated_bytes'], initial_stats['allocated_bytes'])
-    #     self.assertEqual(stats_after_alloc['num_allocs'] - initial_stats['num_allocs'], len(sizes))
+        # Allocate all tensors
+        tensors = []
+        for size in sizes:
+            tensor = torch.empty((size,), device="spyre", dtype=torch.float32)
+            self.assertIsNotNone(tensor.data_ptr())
+            tensors.append(tensor)
 
-    #     # Shuffle tensors for random-order deallocation
-    #     random.shuffle(tensors)
+        # Verify all allocations happened
+        stats_after_alloc = get_allocator_stats()
+        self.assertGreater(
+            stats_after_alloc["allocated_bytes"], initial_stats["allocated_bytes"]
+        )
+        self.assertEqual(
+            stats_after_alloc["num_allocs"] - initial_stats["num_allocs"], len(sizes)
+        )
 
-    #     # Free tensors in random order
-    #     for tensor in tensors:
-    #         del tensor
-    #         gc.collect()
+        # Shuffle tensors for random-order deallocation
+        random.shuffle(tensors)
 
-    #     # Clear the list
-    #     tensors.clear()
-    #     gc.collect()
+        while tensors:
+            tensor = tensors.pop()
+            del tensor
+            gc.collect()
 
-    #     # Verify all memory is freed
-    #     final_stats = get_allocator_stats()
-    #     self.assertEqual(final_stats['allocated_bytes'], initial_stats['allocated_bytes'],
-    #                     "Memory leaked after random-order deallocation")
-    #     self.assertEqual(final_stats['num_allocs'], initial_stats['num_allocs'],
-    #                     "Allocation count mismatch after random-order deallocation")
+        # Verify all memory is freed
+        final_stats = get_allocator_stats()
+        self.assertEqual(
+            final_stats["allocated_bytes"],
+            initial_stats["allocated_bytes"],
+            "Memory leaked after random-order deallocation",
+        )
+        self.assertEqual(
+            final_stats["num_allocs"],
+            initial_stats["num_allocs"],
+            "Allocation count mismatch after random-order deallocation",
+        )
 
     # def test_zero_size_allocation(self):
     #     """
