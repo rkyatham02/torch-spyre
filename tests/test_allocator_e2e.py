@@ -100,37 +100,42 @@ class TestAllocatorE2E(TestCase):
         # Allow for alignment padding (FlexAllocator aligns to DEVICE_ALIGNMENT)
         self.assertGreaterEqual(allocated_bytes, expected_bytes)
 
-    # def test_automatic_deallocation(self):
-    #     """
-    #     Test 2: Automatic deallocation
-    #     Allocate tensor in a scope, let it go out of scope, force GC,
-    #     verify the block is freed (allocator free space increases).
-    #     """
-    #     N = 2048
+    def test_automatic_deallocation(self):
+        """
+        Test 2: Automatic deallocation
+        Allocate tensor in a scope, let it go out of scope, force GC,
+        verify the block is freed (allocator free space increases).
+        """
+        N = 2048
 
-    #     # Get initial stats
-    #     initial_stats = get_allocator_stats()
+        # Get initial stats
+        initial_stats = get_allocator_stats()
 
-    #     # Allocate tensor in a scope
-    #     def allocate_in_scope():
-    #         tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
-    #         # Verify allocation happened
-    #         stats_during = get_allocator_stats()
-    #         self.assertGreater(stats_during['allocated_bytes'], initial_stats['allocated_bytes'])
-    #         self.assertGreater(stats_during['num_allocs'], initial_stats['num_allocs'])
-    #         return stats_during
+        # Allocate tensor in a scope
+        torch.empty((N,), device="spyre", dtype=torch.float32)
 
-    #     stats_during = allocate_in_scope()
+        # Verify allocation happened
+        stats_during = get_allocator_stats()
+        self.assertGreater(
+            stats_during["allocated_bytes"], initial_stats["allocated_bytes"]
+        )
+        self.assertGreater(stats_during["num_allocs"], initial_stats["num_allocs"])
 
-    #     # Force garbage collection to trigger ReportAndDelete
-    #     gc.collect()
+        # Force garbage collection to trigger ReportAndDelete
+        gc.collect()
 
-    #     # Verify deallocation happened
-    #     final_stats = get_allocator_stats()
-    #     self.assertEqual(final_stats['allocated_bytes'], initial_stats['allocated_bytes'],
-    #                     "Memory should be freed after tensor goes out of scope")
-    #     self.assertEqual(final_stats['num_allocs'], initial_stats['num_allocs'],
-    #                     "Allocation count should return to initial value")
+        # Verify deallocation happened
+        final_stats = get_allocator_stats()
+        self.assertEqual(
+            final_stats["allocated_bytes"],
+            initial_stats["allocated_bytes"],
+            "Memory should be freed after tensor goes out of scope",
+        )
+        self.assertEqual(
+            final_stats["num_allocs"],
+            initial_stats["num_allocs"],
+            "Allocation count should return to initial value",
+        )
 
     # def test_explicit_deletion(self):
     #     """
