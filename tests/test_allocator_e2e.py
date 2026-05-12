@@ -243,35 +243,39 @@ class TestAllocatorE2E(TestCase):
             "Allocation count mismatch after random-order deallocation",
         )
 
-    # def test_zero_size_allocation(self):
-    #     """
-    #     Test 5: Zero-size allocation
-    #     Verify that torch.empty((0,), device="spyre") does not crash
-    #     and behavior matches CPU allocator semantics.
-    #     """
-    #     initial_stats = get_allocator_stats()
+    def test_zero_size_allocation(self):
+        """
+        Test 5: Zero-size allocation
+        Verify that torch.empty((0,), device="spyre") does not crash
+        and behavior matches CPU allocator semantics.
+        """
+        initial_stats = get_allocator_stats()
 
-    #     # Allocate zero-size tensor
-    #     tensor = torch.empty((0,), device="spyre", dtype=torch.float32)
+        # Allocate zero-size tensor
+        tensor = torch.empty((0,), device="spyre", dtype=torch.float32)
 
-    #     # Verify tensor properties
-    #     self.assertEqual(tensor.device.type, "spyre")
-    #     self.assertEqual(tensor.shape, (0,))
-    #     self.assertEqual(tensor.numel(), 0)
+        # Verify tensor properties
+        self.assertEqual(tensor.device.type, "spyre")
+        self.assertEqual(tensor.shape, (0,))
+        self.assertEqual(tensor.numel(), 0)
 
-    #     # Zero-size allocations should return nullptr and not allocate memory
-    #     # This matches CPU allocator behavior
-    #     current_stats = get_allocator_stats()
-    #     self.assertEqual(current_stats['allocated_bytes'], initial_stats['allocated_bytes'],
-    #                     "Zero-size allocation should not allocate memory")
+        # Zero-size allocations should return nullptr and not allocate memory
+        current_stats = get_allocator_stats()
+        self.assertEqual(
+            current_stats["allocated_bytes"],
+            initial_stats["allocated_bytes"],
+            "Zero-size allocation should not allocate memory",
+        )
 
-    #     # Delete tensor
-    #     del tensor
-    #     gc.collect()
+        # Delete tensor
+        del tensor
+        gc.collect()
 
-    #     # Verify no memory leak
-    #     final_stats = get_allocator_stats()
-    #     self.assertEqual(final_stats['allocated_bytes'], initial_stats['allocated_bytes'])
+        # Verify no memory leak
+        final_stats = get_allocator_stats()
+        self.assertEqual(
+            final_stats["allocated_bytes"], initial_stats["allocated_bytes"]
+        )
 
     # def test_multi_dimensional_tensors(self):
     #     """
