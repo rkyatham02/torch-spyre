@@ -152,15 +152,14 @@ class TestAllocatorE2E(TestCase):
         2. Memory cleanup works correctly during progressive deallocation
         3. The coalesced space can be reused for larger allocations
         """
-        small_size = 512  # Each tensor is 512 floats = 2KB
+        small_size = 512
         num_tensors = 100
-        batch_size = 10  # Deallocate 10 tensors at a time
-        # Large tensor needs space of 10 small tensors = 5120 floats = 20KB
+        batch_size = 10
         large_size = small_size * batch_size
 
         initial_stats = get_allocator_stats()
 
-        # Step 1: Allocate 100 small tensors
+        # Allocate 100 small tensors
         tensors = []
         for i in range(num_tensors):
             tensor = torch.empty((small_size,), device="spyre", dtype=torch.float32)
@@ -176,9 +175,9 @@ class TestAllocatorE2E(TestCase):
 
         expected_bytes = stats_after_alloc["allocated_bytes"]
 
-        # Step 2: Deallocate tensors in batches and verify coalescing
+        # Deallocate tensors in batches and verify coalescing
         for batch_num in range(num_tensors // batch_size):
-            # Deallocate a batch of 10 adjacent tensors
+            # Deallocate a batch of 10 (batch_size) adjacent tensors
             for i in range(batch_size):
                 tensor = tensors.pop(0)
                 del tensor
