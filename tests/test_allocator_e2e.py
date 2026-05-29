@@ -180,6 +180,8 @@ class TestAllocatorE2E(TestCase):
             for i in range(batch_size):
                 del tensors[0]
 
+            # Force multiple GC passes to ensure all references are cleaned up
+            gc.collect()
             gc.collect()
 
             # After each batch deallocation, verify memory is being freed
