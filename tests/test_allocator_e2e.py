@@ -140,27 +140,30 @@ class TestAllocatorE2E(TestCase):
             "Allocation count should return to initial value",
         )
 
-    def test_coalescing_adjacent_blocks(self):
+    def test_coalescing_with_batch_deallocation(self):
         """
-        Test 3: Coalescing verification
-        Allocate 100 tensors, then deallocate them incrementally (10 at a time)
-        and verify that the allocator properly coalesces adjacent free blocks
-        into contiguous memory at each deallocation step.
+        Test 3: Coalescing verification with batch deallocation
+        Allocate 100 small tensors, then deallocate them in batches of 10.
+        After each batch is freed, verify coalescing by attempting to allocate
+        a larger tensor that requires the combined space of the freed batch.
 
-        This test verifies that as adjacent blocks are freed during progressive
-        deallocation, they merge into larger contiguous free blocks, preventing
-        fragmentation.
+        This test proves that:
+        1. Adjacent freed blocks are coalesced into larger contiguous blocks
+        2. Memory cleanup works correctly during progressive deallocation
+        3. The coalesced space can be reused for larger allocations
         """
-        N = 512
+        small_size = 512  # Each tensor is 512 floats = 2KB
         num_tensors = 100
         batch_size = 10  # Deallocate 10 tensors at a time
+        # Large tensor needs space of 10 small tensors = 5120 floats = 20KB
+        large_size = small_size * batch_size
 
         initial_stats = get_allocator_stats()
 
-        # Allocate 100 tensors
+        # Step 1: Allocate 100 small tensors
         tensors = []
         for i in range(num_tensors):
-            tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
+            tensor = torch.empty((small_size,), device="spyre", dtype=torch.float32)
             tensors.append(tensor)
 
         # Verify all 100 tensors were allocated
@@ -173,40 +176,70 @@ class TestAllocatorE2E(TestCase):
 
         expected_bytes = stats_after_alloc["allocated_bytes"]
 
-        # Deallocate tensors in batches and verify coalescing at each step
+        # Step 2: Deallocate tensors in batches and verify coalescing
         for batch_num in range(num_tensors // batch_size):
-            # Deallocate a batch of tensors
+            # Deallocate a batch of 10 adjacent tensors
             for i in range(batch_size):
                 tensor = tensors.pop(0)
                 del tensor
-                gc.collect()
 
-            # After each batch deallocation, verify memory is being freed
+            gc.collect()
+
+            # After batch deallocation, verify memory is freed
             stats_after_batch = get_allocator_stats()
-
-            # Calculate expected state after this batch
             tensors_freed = (batch_num + 1) * batch_size
             expected_allocs_remaining = num_tensors - tensors_freed
 
             self.assertEqual(
                 stats_after_batch["num_allocs"] - initial_stats["num_allocs"],
                 expected_allocs_remaining,
-                f"After freeing {tensors_freed} tensors, expected {expected_allocs_remaining} remaining allocations",
+                f"After freeing {tensors_freed} tensors, expected {expected_allocs_remaining} remaining",
             )
 
-            # Verify memory is decreasing as we free batches
+            # Verify memory is decreasing
             self.assertLess(
                 stats_after_batch["allocated_bytes"],
                 expected_bytes,
                 f"Memory should decrease after freeing batch {batch_num + 1}",
             )
-
             expected_bytes = stats_after_batch["allocated_bytes"]
 
+            # COALESCING TEST: Try to allocate a large tensor in the freed space
+            # This will only succeed if the 10 freed adjacent blocks were coalesced
+            try:
+                large_tensor = torch.empty(
+                    (large_size,), device="spyre", dtype=torch.float32
+                )
+
+                # Verify the large allocation succeeded
+                self.assertIsNotNone(large_tensor.data_ptr())
+                self.assertGreater(large_tensor.data_ptr(), 0)
+
+                # The large tensor should fit in the coalesced space
+                stats_with_large = get_allocator_stats()
+                self.assertEqual(
+                    stats_with_large["num_allocs"] - initial_stats["num_allocs"],
+                    expected_allocs_remaining + 1,
+                    f"Should have {expected_allocs_remaining} remaining + 1 large allocation",
+                )
+
+                # Clean up the large tensor for next iteration
+                del large_tensor
+                gc.collect()
+
+            except RuntimeError as e:
+                self.fail(
+                    f"Batch {batch_num + 1}: Failed to allocate large tensor ({large_size} floats) "
+                    f"after freeing {batch_size} adjacent small tensors ({small_size} floats each). "
+                    f"This indicates the allocator did NOT coalesce the {batch_size} adjacent free blocks. "
+                    f"Error: {e}"
+                )
+
+        # Final cleanup
         tensors.clear()
         gc.collect()
 
-        # Final check of all memory should be freed and blocks coalesced
+        # Final check: all memory should be freed
         stats_final = get_allocator_stats()
         self.assertEqual(
             stats_final["allocated_bytes"],
@@ -216,12 +249,12 @@ class TestAllocatorE2E(TestCase):
         self.assertEqual(
             stats_final["num_allocs"],
             initial_stats["num_allocs"],
-            "Allocation count should return to initial value, confirming coalescing",
+            "Allocation count should return to initial value",
         )
 
     def test_varying_sizes_random_order(self):
         """
-        Test 4: Varying sizes
+        Test 4: Varying sizes with random deallocation
         Allocate tensors of different sizes (small, medium, large),
         free in random order, verify consistent state.
         """
