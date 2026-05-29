@@ -176,9 +176,9 @@ class TestAllocatorE2E(TestCase):
         # Deallocate tensors in batches and verify coalescing at each step
         for batch_num in range(num_tensors // batch_size):
             # Deallocate a batch of tensors
+            # Always delete from index 0 since the list shrinks with each deletion
             for i in range(batch_size):
-                idx = batch_num * batch_size + i
-                del tensors[idx]
+                del tensors[0]
 
             gc.collect()
 
