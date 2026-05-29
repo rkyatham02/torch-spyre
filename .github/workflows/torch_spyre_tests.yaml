@@ -125,6 +125,8 @@ jobs:
             config: torch_spyre_tests/test_spyre_profiler_config.yaml
           - name: Test Prepare Kernel
             config: torch_spyre_tests/test_prepare_kernel_config.yaml
+          - name: Test Launch Jobplan
+            config: torch_spyre_tests/test_launch_jobplan_config.yaml
           # Inductor tests
           - name: Inductor Building Blocks
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
@@ -136,8 +138,14 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
           - name: Inductor Normalization Scalars
             config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
-          - name: Inductor Ops
-            config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
+          - name: Inductor Ops Matmul
+            config: torch_spyre_tests/inductor/test_inductor_ops_matmul_config.yaml
+          - name: Inductor Ops Reductions
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_config.yaml
+          - name: Inductor Ops Pointwise
+            config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
+          - name: Inductor Ops Misc
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar
@@ -162,6 +170,12 @@ jobs:
             config: torch_spyre_tests/inductor/test_cache_config.yaml
           - name: Inductor Scratchpad Solver
             config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
+          - name: Inductor Coarse Tiling
+            config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
+          - name: Inductor Coarse Tile E2E
+            config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
+          - name: Inductor Unroll Loop Specs
+            config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
@@ -169,6 +183,8 @@ jobs:
             config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
           - name: Tensor Layout
             config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
+          - name: Tensor Memory Format
+            config: torch_spyre_tests/tensors/test_memory_format_config.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
@@ -196,10 +212,10 @@ jobs:
           cd "$CLONED_TORCH_SPYRE_DIR"
           source .venv/bin/activate
 
-          CONFIG="${{ matrix.suite.config }}"
+          CONFIG="tests/configs/${{ matrix.suite.config }}"
 
           echo "Running ${{ matrix.suite.name }} tests..."
-          bash tests/run_test.sh "tests/configs/${CONFIG}" -v --capture=sys
+          bash tests/run_test.sh "$CONFIG" -v
           echo "${{ matrix.suite.name }} tests done"
 
   # ---------------------------------------------------------------------------

@@ -148,9 +148,6 @@ def _single_arg_op_layout(
                 list(range(len(output.size))),
             )
 
-        case spyreop.overwrite.default:
-            return SpyreTensorLayout(output.size, output.dtype)
-
         case prims.convert_element_type.default:
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
@@ -692,6 +689,15 @@ def propagate_mutation_layouts(
                 output = n.node.get_layout()
                 layouts = list(compute_layouts(n.node, output, output_dep, args))
                 n.node.layout = layouts[0]
+        elif isinstance(n.node.data, Reduction):
+            real = n.node.layout.real_layout()
+            if isinstance(real, FixedTiledLayout):
+                n.node.layout = real
+            else:
+                logger.warning(
+                    "propagate_mutation_layouts: unhandled mutation Reduction"
+                    f" op {n.node.get_name()}: real_layout is {type(real)}"
+                )
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
