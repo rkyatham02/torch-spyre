@@ -176,12 +176,10 @@ class TestAllocatorE2E(TestCase):
         # Deallocate tensors in batches and verify coalescing at each step
         for batch_num in range(num_tensors // batch_size):
             # Deallocate a batch of tensors
-            # Pop from the front to remove and delete in one operation
             for i in range(batch_size):
-                tensors.pop(0)
-
-            # Force garbage collection to clean up freed tensors
-            gc.collect()
+                tensor = tensors.pop(0)
+                del tensor
+                gc.collect()
 
             # After each batch deallocation, verify memory is being freed
             stats_after_batch = get_allocator_stats()
