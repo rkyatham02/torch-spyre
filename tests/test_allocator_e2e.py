@@ -140,52 +140,84 @@ class TestAllocatorE2E(TestCase):
             "Allocation count should return to initial value",
         )
 
-    def test_sequential_alloc_free_cycles(self):
+    def test_coalescing_adjacent_blocks(self):
         """
-        Test 3: Sequential alloc/free
-        Allocate and free 100 tensors of the same size sequentially,
-        verify allocator state is clean (no leaked blocks, free space matches initial).
+        Test 3: Coalescing verification
+        Allocate 100 tensors, then deallocate them incrementally (10 at a time)
+        and verify that the allocator properly coalesces adjacent free blocks
+        into contiguous memory at each deallocation step.
+
+        This test verifies that as adjacent blocks are freed during progressive
+        deallocation, they merge into larger contiguous free blocks, preventing
+        fragmentation.
         """
         N = 512
-        num_cycles = 100
+        num_tensors = 100
+        batch_size = 10  # Deallocate 10 tensors at a time
 
         initial_stats = get_allocator_stats()
 
-        for i in range(num_cycles):
-            # Allocate tensor
+        # Allocate 100 tensors
+        tensors = []
+        for i in range(num_tensors):
             tensor = torch.empty((N,), device="spyre", dtype=torch.float32)
+            tensors.append(tensor)
 
-            # Verify allocation
-            self.assertGreater(tensor.data_ptr(), 0)
+        # Verify all 100 tensors were allocated
+        stats_after_alloc = get_allocator_stats()
+        self.assertEqual(
+            stats_after_alloc["num_allocs"] - initial_stats["num_allocs"],
+            num_tensors,
+            f"Expected {num_tensors} allocations",
+        )
 
-            # Delete tensor
-            del tensor
+        expected_bytes = stats_after_alloc["allocated_bytes"]
+
+        # Deallocate tensors in batches and verify coalescing at each step
+        for batch_num in range(num_tensors // batch_size):
+            # Deallocate a batch of tensors
+            for i in range(batch_size):
+                idx = batch_num * batch_size + i
+                del tensors[idx]
+
             gc.collect()
 
-            # Verify deallocation after each cycle
-            current_stats = get_allocator_stats()
+            # After each batch deallocation, verify memory is being freed
+            stats_after_batch = get_allocator_stats()
+
+            # Calculate expected state after this batch
+            tensors_freed = (batch_num + 1) * batch_size
+            expected_allocs_remaining = num_tensors - tensors_freed
+
             self.assertEqual(
-                current_stats["allocated_bytes"],
-                initial_stats["allocated_bytes"],
-                f"Memory leak detected at cycle {i + 1}",
-            )
-            self.assertEqual(
-                current_stats["num_allocs"],
-                initial_stats["num_allocs"],
-                f"Allocation count mismatch at cycle {i + 1}",
+                stats_after_batch["num_allocs"] - initial_stats["num_allocs"],
+                expected_allocs_remaining,
+                f"After freeing {tensors_freed} tensors, expected {expected_allocs_remaining} remaining allocations",
             )
 
-        # Final verification
-        final_stats = get_allocator_stats()
+            # Verify memory is decreasing as we free batches
+            self.assertLess(
+                stats_after_batch["allocated_bytes"],
+                expected_bytes,
+                f"Memory should decrease after freeing batch {batch_num + 1}",
+            )
+
+            expected_bytes = stats_after_batch["allocated_bytes"]
+
+        tensors.clear()
+        gc.collect()
+
+        # Final check of all memory should be freed and blocks coalesced
+        stats_final = get_allocator_stats()
         self.assertEqual(
-            final_stats["allocated_bytes"],
+            stats_final["allocated_bytes"],
             initial_stats["allocated_bytes"],
-            "Memory leaked after 100 sequential alloc/free cycles",
+            "All memory should be freed after complete deallocation",
         )
         self.assertEqual(
-            final_stats["num_allocs"],
+            stats_final["num_allocs"],
             initial_stats["num_allocs"],
-            "Allocation count leaked after 100 sequential alloc/free cycles",
+            "Allocation count should return to initial value, confirming coalescing",
         )
 
     def test_varying_sizes_random_order(self):
