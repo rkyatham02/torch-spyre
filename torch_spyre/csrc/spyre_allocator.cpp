@@ -121,7 +121,8 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
-  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
+  // Skip segment 0 to avoid EAR underflow. Use segments 1-6 for tensors.
+  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {1},
                                       std::nullopt, flex::MemoryType::Tensor);
   return SpyreAllocator::allocate(nbytes, directive);
 }
