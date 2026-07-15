@@ -66,21 +66,24 @@ def _run_pytest_subprocess(
     subprocess, returning the CompletedProcess so callers can inspect stdout
     and returncode.
     """
-    import tempfile
     import os
+    import tempfile
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        conftest_path = os.path.join(tmpdir, "conftest.py")
-        test_path = os.path.join(tmpdir, "test_tmp.py")
-        with open(conftest_path, "w") as f:
-            f.write(textwrap.dedent(conftest_src))
-        with open(test_path, "w") as f:
-            f.write(textwrap.dedent(test_src))
-        return subprocess.run(
-            [sys.executable, "-m", "pytest", "-v", "-rs", tmpdir],
-            capture_output=True,
-            text=True,
-        )
+    tmpdir = tempfile.mkdtemp()
+    conftest_path = os.path.join(tmpdir, "conftest.py")
+    test_path = os.path.join(tmpdir, "test_tmp.py")
+    with open(conftest_path, "w") as f:
+        f.write(textwrap.dedent(conftest_src))
+    with open(test_path, "w") as f:
+        f.write(textwrap.dedent(test_src))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(sys.path)
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-v", "-rs", "-p", "no:cacheprovider", tmpdir],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
 
 
 class TestDeviceErrorSkipIntegration(TestCase):
