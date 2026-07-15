@@ -380,13 +380,7 @@ def spyre_empty_with_layout(
     arg3: SpyreTensorLayout,
 ) -> torch.Tensor: ...
 def has_stream_error() -> bool:
-    """
-    Return true if any stream on the current device is in an unrecoverable
-    error state.
-
-    Once true, the device must be considered dead for the lifetime of this
-    process — there is no recovery path.
-    """
+    """Returns true if any stream on the current device is in an error state."""
     ...
 
 def start_runtime() -> None: ...

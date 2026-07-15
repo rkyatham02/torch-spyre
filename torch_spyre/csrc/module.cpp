@@ -495,14 +495,11 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
-  m.def(
-      "has_stream_error",
-      []() -> bool {
-        auto runtime = spyre::GlobalRuntime::get();
-        if (!runtime) return false;
-        return runtime->hasStreamError();
-      },
-      "Return true if any stream on the current device is in an unrecoverable "
-      "error state. Once true, the device must be considered dead for the "
-      "lifetime of this process — there is no recovery path.");
+  // Returns true if any stream on the current device is in an error state.
+  // When true, no further work can be submitted on the affected streams.
+  m.def("has_stream_error", []() -> bool {
+    auto runtime = spyre::GlobalRuntime::get();
+    if (!runtime) return false;
+    return runtime->hasStreamError();
+  });
 }

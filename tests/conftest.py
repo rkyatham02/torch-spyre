@@ -508,25 +508,19 @@ def _is_spyre_hardware_available() -> bool:
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """
-    Automatically skip tests marked with @pytest.mark.requires_spyre_profiler
-    when the Spyre profiler is not available.
+    Skip tests marked with @pytest.mark.requires_spyre_profiler when the
+    Spyre profiler is not available.
 
-    Also skips any test when the device has entered an unrecoverable error
-    state from a previous test.  The flex stream shutdown latch is permanent —
-    there is no recovery path within a process — so all subsequent tests on
-    that device would produce meaningless results.
+    Also skips any test when the device has entered an error state from a
+    previous test. This check runs before every test so that a single
+    hardware fault does not cascade into a wall of misleading FAILED results.
     """
-    # Skip all remaining tests if the device is in an unrecoverable error state.
-    # This check runs before every test so that a single hardware fault does not
-    # cascade into a wall of misleading FAILED results.
+    # Skip if the device is in an error state from a prior test failure.
     try:
         from torch_spyre import _C  # noqa: PLC0415
 
         if _C.has_stream_error():
-            pytest.skip(
-                "Device is in an unrecoverable error state from a previous test "
-                "failure — no further tests can run on this device"
-            )
+            pytest.skip("Device is in error state")
     except (ImportError, RuntimeError):
         # Runtime not yet initialized or not available — nothing to check.
         pass
