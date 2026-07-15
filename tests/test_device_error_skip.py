@@ -17,19 +17,14 @@
 """
 Tests for the device-error-state skip mechanism.
 
-1. TestHasStreamErrorBinding
-   Tests the _C.has_stream_error() pybind11 binding in isolation using
-   unittest.mock so no hardware fault needs to be induced.
-
-2. TestDeviceErrorSkipIntegration
-   Uses pytest's pytester plugin to spin up a throwaway sub-process pytest
-   session and assert on skip outcomes without touching the host device.
-
-Running
--------
-    pytest tests/test_device_error_skip.py -p pytester
+- TestHasStreamErrorBinding: unit-tests _C.has_stream_error() via unittest.mock.
+- TestDeviceErrorSkipIntegration: runs hermetic subprocess pytest sessions to
+  verify the conftest skip hook end-to-end.
 """
 
+import subprocess
+import sys
+import textwrap
 from unittest.mock import patch
 
 from torch.testing._internal.common_utils import TestCase, run_tests
@@ -63,118 +58,134 @@ class TestHasStreamErrorBinding(TestCase):
             self.assertFalse(_C.has_stream_error())
 
 
-class TestDeviceErrorSkipIntegration:
+def _run_pytest_subprocess(
+    conftest_src: str, test_src: str
+) -> subprocess.CompletedProcess:
+    """
+    Write conftest.py and test_tmp.py into a temp dir and run pytest in a
+    subprocess, returning the CompletedProcess so callers can inspect stdout
+    and returncode.
+    """
+    import tempfile
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        conftest_path = os.path.join(tmpdir, "conftest.py")
+        test_path = os.path.join(tmpdir, "test_tmp.py")
+        with open(conftest_path, "w") as f:
+            f.write(textwrap.dedent(conftest_src))
+        with open(test_path, "w") as f:
+            f.write(textwrap.dedent(test_src))
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-v", "-rs", tmpdir],
+            capture_output=True,
+            text=True,
+        )
+
+
+class TestDeviceErrorSkipIntegration(TestCase):
     """
     Verifies the conftest pytest_runtest_setup hook behaviour end-to-end.
 
-    Uses pytest's pytester plugin to run a hermetic sub-session so the host
-    device state is never mutated and outcomes are inspectable as plain data.
+    Runs a hermetic subprocess pytest session so the host device state is
+    never mutated and outcomes are inspectable as plain text.
     """
 
-    def test_healthy_device_does_not_skip(self, pytester):
+    def test_healthy_device_does_not_skip(self):
         """When has_stream_error() is False the test must run normally."""
-        pytester.makepyfile(
-            conftest="""
-            from unittest.mock import patch
-            import pytest
-            from torch_spyre import _C
+        result = _run_pytest_subprocess(
+            conftest_src="""
+                from unittest.mock import patch
+                import pytest
+                from torch_spyre import _C
 
-            def pytest_runtest_setup(item):
-                with patch.object(_C, "has_stream_error", return_value=False):
-                    try:
-                        if _C.has_stream_error():
-                            pytest.skip("Device is in error state")
-                    except (ImportError, RuntimeError):
-                        pass
-            """
+                def pytest_runtest_setup(item):
+                    with patch.object(_C, "has_stream_error", return_value=False):
+                        try:
+                            if _C.has_stream_error():
+                                pytest.skip("Device is in error state")
+                        except (ImportError, RuntimeError):
+                            pass
+            """,
+            test_src="""
+                def test_should_run():
+                    assert True
+            """,
         )
-        pytester.makepyfile(
-            """
-            def test_should_run():
-                assert True
-            """
-        )
-        result = pytester.runpytest()
-        result.assert_outcomes(passed=1, skipped=0)
+        self.assertIn("1 passed", result.stdout)
+        self.assertNotIn("skipped", result.stdout)
 
-    def test_faulted_device_skips_all_tests(self, pytester):
+    def test_faulted_device_skips_all_tests(self):
         """
         When has_stream_error() is True every test in the session must be
         skipped. Two tests are declared to confirm all are affected, not
         just the first.
         """
-        pytester.makepyfile(
-            conftest="""
-            from unittest.mock import patch
-            import pytest
-            from torch_spyre import _C
+        result = _run_pytest_subprocess(
+            conftest_src="""
+                from unittest.mock import patch
+                import pytest
+                from torch_spyre import _C
 
-            def pytest_runtest_setup(item):
-                with patch.object(_C, "has_stream_error", return_value=True):
-                    try:
+                def pytest_runtest_setup(item):
+                    with patch.object(_C, "has_stream_error", return_value=True):
+                        try:
+                            if _C.has_stream_error():
+                                pytest.skip("Device is in error state")
+                        except (ImportError, RuntimeError):
+                            pass
+            """,
+            test_src="""
+                def test_first():
+                    assert True
+
+                def test_second():
+                    assert True
+            """,
+        )
+        self.assertIn("2 skipped", result.stdout)
+        self.assertNotIn("passed", result.stdout)
+
+    def test_skip_message_content(self):
+        """The skip reason reported by pytest must contain 'Device is in error state'."""
+        result = _run_pytest_subprocess(
+            conftest_src="""
+                from unittest.mock import patch
+                import pytest
+                from torch_spyre import _C
+
+                def pytest_runtest_setup(item):
+                    with patch.object(_C, "has_stream_error", return_value=True):
                         if _C.has_stream_error():
                             pytest.skip("Device is in error state")
+            """,
+            test_src="""
+                def test_something():
+                    pass
+            """,
+        )
+        self.assertIn("1 skipped", result.stdout)
+        self.assertIn("Device is in error state", result.stdout)
+
+    def test_import_error_does_not_block_test(self):
+        """If _C is unavailable the hook must silently pass and not skip."""
+        result = _run_pytest_subprocess(
+            conftest_src="""
+                import pytest
+
+                def pytest_runtest_setup(item):
+                    try:
+                        raise ImportError("_C not available")
                     except (ImportError, RuntimeError):
                         pass
-            """
+            """,
+            test_src="""
+                def test_still_runs():
+                    assert True
+            """,
         )
-        pytester.makepyfile(
-            """
-            def test_first():
-                assert True
-
-            def test_second():
-                assert True
-            """
-        )
-        result = pytester.runpytest()
-        result.assert_outcomes(passed=0, skipped=2)
-
-    def test_skip_message_content(self, pytester):
-        """The skip message must contain 'Device is in error state'."""
-        pytester.makepyfile(
-            conftest="""
-            from unittest.mock import patch
-            import pytest
-            from torch_spyre import _C
-
-            def pytest_runtest_setup(item):
-                with patch.object(_C, "has_stream_error", return_value=True):
-                    if _C.has_stream_error():
-                        pytest.skip("Device is in error state")
-            """
-        )
-        pytester.makepyfile(
-            """
-            def test_something():
-                pass
-            """
-        )
-        result = pytester.runpytest("-v")
-        result.assert_outcomes(skipped=1)
-        result.stdout.fnmatch_lines(["*Device is in error state*"])
-
-    def test_import_error_does_not_block_test(self, pytester):
-        """If _C is unavailable the hook must silently pass and not skip."""
-        pytester.makepyfile(
-            conftest="""
-            import pytest
-
-            def pytest_runtest_setup(item):
-                try:
-                    raise ImportError("_C not available")
-                except (ImportError, RuntimeError):
-                    pass
-            """
-        )
-        pytester.makepyfile(
-            """
-            def test_still_runs():
-                assert True
-            """
-        )
-        result = pytester.runpytest()
-        result.assert_outcomes(passed=1, skipped=0)
+        self.assertIn("1 passed", result.stdout)
+        self.assertNotIn("skipped", result.stdout)
 
 
 if __name__ == "__main__":
