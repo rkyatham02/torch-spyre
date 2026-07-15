@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-import re
+import regex as re
 
 import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
@@ -510,7 +510,27 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     """
     Automatically skip tests marked with @pytest.mark.requires_spyre_profiler
     when the Spyre profiler is not available.
+
+    Also skips any test when the device has entered an unrecoverable error
+    state from a previous test.  The flex stream shutdown latch is permanent —
+    there is no recovery path within a process — so all subsequent tests on
+    that device would produce meaningless results.
     """
+    # Skip all remaining tests if the device is in an unrecoverable error state.
+    # This check runs before every test so that a single hardware fault does not
+    # cascade into a wall of misleading FAILED results.
+    try:
+        from torch_spyre import _C  # noqa: PLC0415
+
+        if _C.has_stream_error():
+            pytest.skip(
+                "Device is in an unrecoverable error state from a previous test "
+                "failure — no further tests can run on this device"
+            )
+    except (ImportError, RuntimeError):
+        # Runtime not yet initialized or not available — nothing to check.
+        pass
+
     if "requires_spyre_profiler" in item.keywords:
         use_profiler = os.environ.get("USE_SPYRE_PROFILER") == "1"
         hardware_available = _is_spyre_hardware_available()

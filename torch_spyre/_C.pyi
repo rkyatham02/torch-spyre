@@ -16,6 +16,7 @@ __all__: list[str] = [
     "current_stream",
     "default_stream",
     "get_stream_from_pool",
+    "has_stream_error",
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
@@ -378,5 +379,15 @@ def spyre_empty_with_layout(
     arg2: torch.dtype,
     arg3: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+def has_stream_error() -> bool:
+    """
+    Return true if any stream on the current device is in an unrecoverable
+    error state.
+
+    Once true, the device must be considered dead for the lifetime of this
+    process — there is no recovery path.
+    """
+    ...
+
 def start_runtime() -> None: ...
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...
