@@ -62,7 +62,7 @@ class TestHasStreamErrorBinding(TestCase):
 class TestDeviceErrorSkipIntegration(TestCase):
     """
     Calls pytest_runtest_setup() directly with a mock item to verify the
-    skip hook without subprocesses or pytester.
+    skip hook
     """
 
     def _make_item(self, keywords=()):
