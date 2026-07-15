@@ -27,7 +27,7 @@ import sys
 import textwrap
 from unittest.mock import patch
 
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import TestCase
 
 from torch_spyre import _C
 
@@ -77,7 +77,7 @@ def _run_pytest_subprocess(
     with open(test_path, "w") as f:
         f.write(textwrap.dedent(test_src))
     env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(sys.path)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-v", "-rs", "-p", "no:cacheprovider", tmpdir],
         capture_output=True,
@@ -115,7 +115,7 @@ class TestDeviceErrorSkipIntegration(TestCase):
                     assert True
             """,
         )
-        self.assertIn("1 passed", result.stdout)
+        self.assertIn("1 passed", result.stdout, msg=result.stdout)
         self.assertNotIn("skipped", result.stdout)
 
     def test_faulted_device_skips_all_tests(self):
@@ -192,4 +192,10 @@ class TestDeviceErrorSkipIntegration(TestCase):
 
 
 if __name__ == "__main__":
-    run_tests()
+    import unittest
+
+    # TestHasStreamErrorBinding uses PyTorch's run_tests(); the integration
+    # class uses plain unittest since run_tests() hijacks stdout/stderr which
+    # breaks capture_output=True in the subprocess helper.
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestHasStreamErrorBinding)
+    unittest.TextTestRunner(verbosity=2).run(suite)
