@@ -518,7 +518,7 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
-  // Returns true if any stream on the current device is in an error state.
+  // Returns true if any stream in the runtime has been shut down (unrecoverable).
   // When true, no further work can be submitted on the affected streams.
   m.def("has_stream_error", []() -> bool {
     auto runtime = spyre::GlobalRuntime::get();
