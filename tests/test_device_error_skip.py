@@ -24,13 +24,26 @@ Tests for the device-error-state skip mechanism.
 Usage: ``python test_device_error_skip.py`` or ``pytest test_device_error_skip.py``
 """
 
+import importlib.util
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from torch.testing._internal.common_utils import TestCase, run_tests
 
-from conftest import pytest_runtest_setup
 from torch_spyre import _C
+
+# Load tests/conftest.py by explicit path so we always get the right module
+# regardless of sys.path ordering or the presence of a root-level conftest.py.
+_CONFTEST_PATH = Path(__file__).parent / "conftest.py"
+_spec = importlib.util.spec_from_file_location("tests.conftest", _CONFTEST_PATH)
+assert _spec is not None and _spec.loader is not None, (
+    f"Could not load conftest from {_CONFTEST_PATH}"
+)
+_tests_conftest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_tests_conftest)  # type: ignore[union-attr]
+pytest_runtest_setup = _tests_conftest.pytest_runtest_setup
 
 
 class TestHasStreamErrorBinding(TestCase):
@@ -92,8 +105,10 @@ class TestDeviceErrorSkipIntegration(TestCase):
         self.assertIn("Device is in error state", str(ctx.exception))
 
     def test_import_error_does_not_block_test(self):
-        """If _C raises ImportError the hook must silently pass."""
-        with patch.object(_C, "has_stream_error", side_effect=ImportError):
+        """If torch_spyre._C is not importable the hook must silently pass."""
+        # Simulate the module being absent so `from torch_spyre import _C`
+        # inside pytest_runtest_setup raises ImportError.
+        with patch.dict(sys.modules, {"torch_spyre._C": None}):
             # Should complete without raising anything
             pytest_runtest_setup(self._make_item())
 
