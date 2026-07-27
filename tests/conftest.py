@@ -516,6 +516,12 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     hardware fault does not cascade into a wall of misleading FAILED results.
     """
     # Skip if the device is in an error state from a prior test failure.
+    # NOTE: This hook only guarantees that tests running AFTER a device fault are
+    # cleanly SKIPPED — it does NOT guarantee the faulting test itself is the one
+    # that FAILS. A hardware fault flips the shutdown flag asynchronously, so it may
+    # not be visible until a later test's setup; the faulting test can pass and a
+    # later test gets skipped instead. Attributing the failure to the triggering
+    # test is out of scope here (tracked separately).
     try:
         from torch_spyre import _C  # noqa: PLC0415
 
