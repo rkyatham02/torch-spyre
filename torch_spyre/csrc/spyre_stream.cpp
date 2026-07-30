@@ -32,6 +32,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
@@ -209,6 +210,10 @@ flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
               "SpyreStream: no flex handle for stream id ", id(),
               " — was the stream pool initialized for this device?");
   return it->second;
+}
+
+flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
+  return resolveRuntimeHandle();
 }
 
 void SpyreStream::copyAsyncImpl(void* cpu_ptr,
@@ -503,6 +508,42 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
     sync_one_device(
         c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
   }
+}
+
+// ============================================================================
+// Error query functions (declared in spyre_error.h)
+// ============================================================================
+
+const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept {
+  switch (error) {
+    case SpyreStreamError::Success:
+      return "Success";
+    case SpyreStreamError::StreamError:
+      return "StreamError";
+    default:
+      return "Unknown";
+  }
+}
+
+SpyreStreamError SpyreStreamGetError(const SpyreStream& stream) {
+  flex::RuntimeStream* handle = stream.getRuntimeHandle();
+  if (handle->needsShutdown()) {
+    return SpyreStreamError::StreamError;
+  }
+  return SpyreStreamError::Success;
+}
+
+SpyreDeviceState SpyreGetDeviceState() {
+  auto runtime = GlobalRuntime::get();
+  if (!runtime) {
+    return SpyreDeviceState::NotInitialized;
+  }
+  // Use RuntimeContext::hasStreamError() which already iterates all streams
+  // under its own internal lock — consistent with the existing roll-up.
+  if (runtime->hasStreamError()) {
+    return SpyreDeviceState::StreamError;
+  }
+  return SpyreDeviceState::Ok;
 }
 
 }  // namespace spyre

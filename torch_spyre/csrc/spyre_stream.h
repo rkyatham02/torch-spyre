@@ -68,6 +68,14 @@ class SpyreStream {
   // Conversions
   c10::Stream unwrap() const;
 
+  /**
+   * @brief Return the underlying flex::RuntimeStream handle for this stream.
+   *
+   * Used by SpyreStreamGetError() (spyre_error.h) to query per-stream state
+   * without exposing flex internals through the pybind layer.
+   */
+  flex::RuntimeStream* getRuntimeHandle() const;
+
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr,
