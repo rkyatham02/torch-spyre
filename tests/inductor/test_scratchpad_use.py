@@ -930,11 +930,17 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     def _sdpa_case(self):
         """4D scaled-dot-product attention. With every op LX-eligible, the plan
         keeps most of the matmul -> softmax -> matmul chain resident (buf0,
-        buf2-buf8, all 32-way split); one matmul output (buf1), a normalised
-        output (buf9), the final result (buf12) and the empty constant of the
-        decomposition (buf10) land in HBM. The resident ops take single-axis
-        32-way splits; buf12 takes a 4x4 two-axis split
-        (``((64, 4), (16384, 4))``) and the empty constant is undivided.
+        buf2-buf7, all 32-way split); two matmul outputs (buf1, buf8), the empty
+        constant of the decomposition (buf9) and the final result (buf11) land in
+        HBM. The resident ops take single-axis 32-way splits; buf11 takes a 4x4
+        two-axis split (``((64, 4), (16384, 4))``) and the empty constant is
+        undivided.
+
+        Note: under PT 2.12 the SDPA decomposition graph has one fewer buffer
+        than PT 2.11 (12 vs 13); the buffers renumbered (former buf10/buf12 are
+        now buf9/buf11) and buf8 now spills to HBM. Numerics are unchanged
+        (verified against CPU); only the buffer plan shape changed with the
+        upstream decomposition.
         """
         batch, heads, seq_len, head_dim = 1, 4, 256, 64
         return (
@@ -954,11 +960,9 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                     "buf5": ("LX", 524288, (((256, 32),), ())),
                     "buf6": ("LX", 131072, (((1, 32),), ())),
                     "buf7": ("LX", 524288, (((256, 32),), ())),
-                    "buf8": ("LX", 131072, (((64, 32),), ())),
-                    "buf9": ("HBM", 131072, (((256, 32),), ())),
-                    "buf10": ("HBM", 128, ((), ())),
-                    # buf11 is eliminated in dedup_and_promote_constants
-                    "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
+                    "buf8": ("HBM", 131072, (((64, 32),), ())),
+                    "buf9": ("HBM", 128, ((), ())),
+                    "buf11": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
                 }
             },
         )
