@@ -523,14 +523,12 @@ PYBIND11_MODULE(_C, m) {
 
   py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
       .value("Success", spyre::SpyreStreamError::Success)
-      .value("StreamError", spyre::SpyreStreamError::StreamError)
-      .export_values();
+      .value("Shutdown", spyre::SpyreStreamError::Shutdown);
 
   py::enum_<spyre::SpyreDeviceState>(m, "SpyreDeviceState")
       .value("Ok", spyre::SpyreDeviceState::Ok)
       .value("NotInitialized", spyre::SpyreDeviceState::NotInitialized)
-      .value("StreamError", spyre::SpyreDeviceState::StreamError)
-      .export_values();
+      .value("StreamError", spyre::SpyreDeviceState::StreamError);
 
   m.def(
       "stream_get_error",

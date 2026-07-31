@@ -390,9 +390,9 @@ def has_stream_error() -> bool:
 
 class SpyreStreamError:
     Success: typing.ClassVar[SpyreStreamError]  # value = <SpyreStreamError.Success: 0>
-    StreamError: typing.ClassVar[
+    Shutdown: typing.ClassVar[
         SpyreStreamError
-    ]  # value = <SpyreStreamError.StreamError: 1>
+    ]  # value = <SpyreStreamError.Shutdown: 1>
     __members__: typing.ClassVar[dict[str, SpyreStreamError]]
     def __eq__(self, other: typing.Any) -> bool: ...
     def __hash__(self) -> int: ...

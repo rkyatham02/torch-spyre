@@ -510,16 +510,12 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
   }
 }
 
-// ============================================================================
-// Error query functions (declared in spyre_error.h)
-// ============================================================================
-
 const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept {
   switch (error) {
     case SpyreStreamError::Success:
       return "Success";
-    case SpyreStreamError::StreamError:
-      return "StreamError";
+    case SpyreStreamError::Shutdown:
+      return "Shutdown";
     default:
       return "Unknown";
   }
@@ -527,10 +523,8 @@ const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept {
 
 SpyreStreamError SpyreStreamGetError(const SpyreStream& stream) {
   flex::RuntimeStream* handle = stream.getRuntimeHandle();
-  if (handle->needsShutdown()) {
-    return SpyreStreamError::StreamError;
-  }
-  return SpyreStreamError::Success;
+  return handle->needsShutdown() ? SpyreStreamError::Shutdown
+                                 : SpyreStreamError::Success;
 }
 
 SpyreDeviceState SpyreGetDeviceState() {
@@ -538,8 +532,12 @@ SpyreDeviceState SpyreGetDeviceState() {
   if (!runtime) {
     return SpyreDeviceState::NotInitialized;
   }
-  // Use RuntimeContext::hasStreamError() which already iterates all streams
-  // under its own internal lock — consistent with the existing roll-up.
+  // NOTE: intentionally uses RuntimeContext::hasStreamError() (one locked
+  // iteration) instead of rolling up SpyreStreamGetError per stream. These
+  // agree only while both reduce to needsShutdown().
+  // TODO(#3365): once flex exposes typed per-stream codes, roll up via
+  // SpyreStreamGetError so the aggregate (and the pytest skip reason) can
+  // surface the actual fault class.
   if (runtime->hasStreamError()) {
     return SpyreDeviceState::StreamError;
   }

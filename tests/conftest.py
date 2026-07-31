@@ -527,11 +527,8 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 
         state = _C.get_device_state()
         if state == _C.SpyreDeviceState.StreamError:
-            # Include the error class name in the skip reason so it appears in
-            # the pytest output and can be matched by tests.
-            error_name = _C.SpyreStreamError.StreamError.name
             pytest.skip(
-                f"Device is in error state ({error_name})"
+                f"Device is in error state ({state.name})"
                 " — a process restart is required"
             )
         # SpyreDeviceState.NotInitialized → proceed (runtime not started yet)

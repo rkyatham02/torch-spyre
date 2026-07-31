@@ -52,24 +52,24 @@ pytest_runtest_setup = _tests_conftest.pytest_runtest_setup
 class TestStreamErrorBindings(TestCase):
     """Unit tests for the typed SpyreStreamError / SpyreDeviceState bindings."""
 
-    # ── SpyreStreamError ──────────────────────────────────────────────────────
+    # Testing SpyreStreamError
 
     def test_stream_error_enum_members_exist(self):
-        """SpyreStreamError must expose Success and StreamError members."""
+        """SpyreStreamError must expose Success and Shutdown members."""
         self.assertIsInstance(_C.SpyreStreamError.Success, _C.SpyreStreamError)
-        self.assertIsInstance(_C.SpyreStreamError.StreamError, _C.SpyreStreamError)
+        self.assertIsInstance(_C.SpyreStreamError.Shutdown, _C.SpyreStreamError)
 
     def test_stream_error_integer_values(self):
-        """SpyreStreamError values must match the documented ABI (Success=0, StreamError=1)."""
+        """SpyreStreamError values must match the documented ABI (Success=0, Shutdown=1)."""
         self.assertEqual(int(_C.SpyreStreamError.Success), 0)
-        self.assertEqual(int(_C.SpyreStreamError.StreamError), 1)
+        self.assertEqual(int(_C.SpyreStreamError.Shutdown), 1)
 
     def test_stream_error_names(self):
         """SpyreStreamError .name must return the enum member's string name."""
         self.assertEqual(_C.SpyreStreamError.Success.name, "Success")
-        self.assertEqual(_C.SpyreStreamError.StreamError.name, "StreamError")
+        self.assertEqual(_C.SpyreStreamError.Shutdown.name, "Shutdown")
 
-    # ── SpyreDeviceState ─────────────────────────────────────────────────────
+    # Testing SpyreDeviceState
 
     def test_device_state_enum_members_exist(self):
         """SpyreDeviceState must expose Ok, NotInitialized, and StreamError."""
@@ -89,7 +89,7 @@ class TestStreamErrorBindings(TestCase):
         self.assertEqual(_C.SpyreDeviceState.NotInitialized.name, "NotInitialized")
         self.assertEqual(_C.SpyreDeviceState.StreamError.name, "StreamError")
 
-    # ── get_device_state() ───────────────────────────────────────────────────
+    # Testing get_device_state()
 
     def test_get_device_state_returns_device_state(self):
         """get_device_state() must be importable and return a SpyreDeviceState."""
@@ -129,7 +129,16 @@ class TestStreamErrorBindings(TestCase):
             self.assertEqual(_C.get_device_state(), _C.SpyreDeviceState.StreamError)
             self.assertEqual(_C.get_device_state(), _C.SpyreDeviceState.Ok)
 
-    # ── stream_get_error_string() ─────────────────────────────────────────────
+    # Testing stream_get_error() / stream_get_error_string()
+
+    def test_stream_get_error_returns_stream_error(self):
+        """stream_get_error() must return a SpyreStreamError."""
+        mock_stream = MagicMock()
+        with patch.object(
+            _C, "stream_get_error", return_value=_C.SpyreStreamError.Success
+        ):
+            result = _C.stream_get_error(mock_stream)
+        self.assertIsInstance(result, _C.SpyreStreamError)
 
     def test_error_string_success(self):
         """stream_get_error_string(Success) == 'Success'."""
@@ -137,10 +146,10 @@ class TestStreamErrorBindings(TestCase):
             _C.stream_get_error_string(_C.SpyreStreamError.Success), "Success"
         )
 
-    def test_error_string_stream_error(self):
-        """stream_get_error_string(StreamError) == 'StreamError'."""
+    def test_error_string_shutdown(self):
+        """stream_get_error_string(Shutdown) == 'Shutdown'."""
         self.assertEqual(
-            _C.stream_get_error_string(_C.SpyreStreamError.StreamError), "StreamError"
+            _C.stream_get_error_string(_C.SpyreStreamError.Shutdown), "Shutdown"
         )
 
 
