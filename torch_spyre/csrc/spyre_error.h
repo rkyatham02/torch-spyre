@@ -18,26 +18,25 @@
 
 namespace spyre {
 
-// Forward declaration — defined in spyre_stream.h
 class SpyreStream;
 
 // Per-stream error state. Values 2-5 (HardwareFault, Timeout, MemoryFault,
 // CoreUnavailable) are reserved pending flex::RuntimeStream typed error codes.
 enum class SpyreStreamError : int {
-  Success = 0,   ///< Stream is healthy (not shut down; deferred errors surface
-                 ///< only on synchronize())
-  Shutdown = 1,  ///< Stream has been shut down (unrecoverable)
+  Success = 0,   // Stream is healthy (not shut down; deferred errors surface
+                 // only on synchronize())
+  Shutdown = 1,  // Stream has been shut down (unrecoverable)
 };
 
 // Device-level aggregate over all streams in the global runtime.
 enum class SpyreDeviceState : int {
-  Ok = 0,              ///< All streams healthy; device is usable
-  NotInitialized = 1,  ///< Runtime not yet created — treat as Ok, proceed
-  StreamError = 2,     ///< One or more streams are in an unrecoverable state
+  Ok = 0,              // All streams healthy; device is usable
+  NotInitialized = 1,  // Runtime not yet created — treat as Ok, proceed
+  StreamError = 2,     // One or more streams are in an unrecoverable state
 };
 
 /**
- * @brief Return a string literal for a SpyreStreamError value.
+ * @brief Returns a string literal for a SpyreStreamError value.
  * @returns A non-null string such as "Success" or "Shutdown". Never throws.
  */
 const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept;
