@@ -68,12 +68,10 @@ class SpyreStream {
   // Conversions
   c10::Stream unwrap() const;
 
-  // Returns the underlying flex::RuntimeStream handle. Used by
-  // SpyreStreamGetError().
-  flex::RuntimeStream* getRuntimeHandle() const;
-
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
+
+  friend SpyreStreamError SpyreStreamGetError(const SpyreStream& stream);
   void copyAsyncImpl(void* cpu_ptr,
                      const flex::CompositeAddress* device_address,
                      const DataConversionInfo* dci, bool host2device) const;
