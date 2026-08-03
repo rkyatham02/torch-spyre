@@ -19,7 +19,6 @@ __all__: list[str] = [
     "default_stream",
     "get_device_state",
     "get_stream_from_pool",
-    "has_stream_error",
     "set_current_stream",
     "stream_get_error",
     "stream_get_error_string",
@@ -384,9 +383,6 @@ def spyre_empty_with_layout(
     arg2: torch.dtype,
     arg3: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def has_stream_error() -> bool:
-    """Deprecated. Use get_device_state() instead."""
-    ...
 
 class SpyreStreamError:
     Success: typing.ClassVar[SpyreStreamError]  # value = <SpyreStreamError.Success: 0>

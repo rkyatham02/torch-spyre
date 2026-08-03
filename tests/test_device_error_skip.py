@@ -19,8 +19,6 @@ Tests for the device-error-state skip mechanism.
 
 - TestStreamErrorBindings: unit-tests the typed _C.SpyreStreamError /
   _C.SpyreDeviceState enums and the associated query functions.
-- TestHasStreamErrorBackCompat: verifies that the deprecated
-  _C.has_stream_error() wrapper still works correctly.
 - TestDeviceErrorSkipIntegration: calls the conftest hook directly to verify
   skip behaviour without spawning subprocesses.
 
@@ -151,29 +149,6 @@ class TestStreamErrorBindings(TestCase):
         self.assertEqual(
             _C.stream_get_error_string(_C.SpyreStreamError.Shutdown), "Shutdown"
         )
-
-
-class TestHasStreamErrorBackCompat(TestCase):
-    """
-    Verifies that the deprecated has_stream_error() wrapper is present and
-    returns a bool. The C++ implementation delegates to SpyreGetDeviceState()
-    internally; here we mock the Python-visible symbol directly.
-    """
-
-    def test_back_compat_false_when_healthy(self):
-        """has_stream_error() returns False when mocked healthy."""
-        with patch.object(_C, "has_stream_error", return_value=False):
-            self.assertFalse(_C.has_stream_error())
-
-    def test_back_compat_true_when_faulted(self):
-        """has_stream_error() returns True when mocked faulted."""
-        with patch.object(_C, "has_stream_error", return_value=True):
-            self.assertTrue(_C.has_stream_error())
-
-    def test_back_compat_returns_bool(self):
-        """has_stream_error() must return a plain bool."""
-        result = _C.has_stream_error()
-        self.assertIsInstance(result, bool)
 
 
 class TestDeviceErrorSkipIntegration(TestCase):

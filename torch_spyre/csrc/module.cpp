@@ -551,8 +551,4 @@ PYBIND11_MODULE(_C, m) {
       "Return the SpyreDeviceState aggregate for the process. "
       "Returns NotInitialized when the runtime has not been created yet; "
       "callers should treat this as 'proceed / no error'.");
-
-  m.def("has_stream_error", []() -> bool {
-    return spyre::SpyreGetDeviceState() == spyre::SpyreDeviceState::StreamError;
-  });
 }

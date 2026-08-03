@@ -3452,7 +3452,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "disabled (see FIXME on kv_block_size in this file), unrelated to "
             "carry propagation. Confirmed (4/4 local full-suite runs) to leave "
             "the device in an error state that cascades skips to every later "
-            "test in the same process (see conftest.py's has_stream_error() "
+            "test in the same process (see conftest.py's get_device_state() "
             "check) when run as xfail -- skipped outright instead. Revisit "
             "once the Lk coarse-tiling limitation above is fixed; a real fix "
             "there should make this test pass rather than merely change its "
