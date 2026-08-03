@@ -212,6 +212,11 @@ flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   return it->second;
 }
 
+SpyreStreamError SpyreStream::getError() const {
+  return resolveRuntimeHandle()->needsShutdown() ? SpyreStreamError::Shutdown
+                                                 : SpyreStreamError::Success;
+}
+
 void SpyreStream::copyAsyncImpl(void* cpu_ptr,
                                 const flex::CompositeAddress* device_address,
                                 const DataConversionInfo* dci,
@@ -518,9 +523,7 @@ const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept {
 }
 
 SpyreStreamError SpyreStreamGetError(const SpyreStream& stream) {
-  flex::RuntimeStream* handle = stream.resolveRuntimeHandle();
-  return handle->needsShutdown() ? SpyreStreamError::Shutdown
-                                 : SpyreStreamError::Success;
+  return stream.getError();
 }
 
 SpyreDeviceState SpyreGetDeviceState() {
