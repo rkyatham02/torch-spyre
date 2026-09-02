@@ -51,7 +51,7 @@ class TestSplitExecutionStructural(TestCase):
             )
             job_plan = _spyre_C.prepare_kernel(spyrecode_dir)
 
-            inp = torch.zeros(64, dtype=torch.float16, device=self.device)
+            inp = torch.zeros(64, 16, dtype=torch.float16, device=self.device)
             stream = torch.Stream(self.device)
             with stream:
                 _spyre_C.launch_jobplan(job_plan, [inp])
