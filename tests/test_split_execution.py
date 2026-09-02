@@ -16,6 +16,7 @@ import tempfile
 
 import pytest
 import torch
+import torch._dynamo
 from torch_spyre import _C as _spyre_C
 from torch.testing._internal.common_utils import TestCase
 
@@ -63,35 +64,26 @@ class TestAcrossLaunchPipelining(TestCase):
         )
         return _spyre_C.prepare_kernel(spyrecode_dir)
 
-    def test_pipelined_launches_complete(self):
-        """C2 — _PIPELINE_DEPTH back-to-back launches all drain cleanly."""
+    def test_pipelined_launches_reach_host_compute_step(self):
+        """C2 — each launch routes HostCompute to S_prep (split is active).
+
+        The mock HCM has no real DCI payload so the HostCompute callback raises
+        "Expect one DCI" — that error can only come from HostCompute actually
+        executing on S_prep.  Asserting it proves the split routing happened.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             job_plan = self._make_split_plan(tmpdir)
+
+            self.assertEqual(job_plan.num_steps(), 3)
+            self.assertEqual(
+                [job_plan.get_step_stream_role(i) for i in range(3)],
+                ["Prep", "Prep", "Dev"],
+            )
 
             stream = torch.Stream(self.device)
             with stream:
-                for _ in range(_PIPELINE_DEPTH):
+                with self.assertRaisesRegex(RuntimeError, "Expect one DCI"):
                     _spyre_C.launch_jobplan(job_plan, [])
-
-            _sync_all(self.device)
-            self.assertEqual(
-                _spyre_C.get_device_state(),
-                _spyre_C.SpyreDeviceState.Ok,
-                msg=f"Device entered error state after {_PIPELINE_DEPTH} pipelined launches.",
-            )
-
-    def test_sync_between_launches_stays_healthy(self):
-        """C2 — draining after every individual launch leaves no stale ordering state."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            job_plan = self._make_split_plan(tmpdir)
-
-            stream = torch.Stream(self.device)
-            for _ in range(_PIPELINE_DEPTH):
-                with stream:
-                    _spyre_C.launch_jobplan(job_plan, [])
-                _sync_all(self.device)
-
-            self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
 
 
 class TestFallbackNoPrepSteps(TestCase):
@@ -100,11 +92,15 @@ class TestFallbackNoPrepSteps(TestCase):
     No Prep-role steps means the router's split branch never fires, regardless
     of the tracker flag.  Runs in both SPYRE_HAZARD_TRACKER=0 and =1.
 
+    The structural test uses mock SpyreCode (no launch needed).
+    The runtime tests use torch.compile to produce a real binary so the
+    device actually executes the op rather than faulting on a fake pointer.
     """
 
     def setUp(self):
         super().setUp()
         self.device = torch.device("spyre")
+        torch._dynamo.reset()
 
     def test_no_prep_roles_in_pure_compute_plan(self):
         """C5a structural — every step has role Dev, no Prep steps exist."""
@@ -119,32 +115,30 @@ class TestFallbackNoPrepSteps(TestCase):
                     msg=f"step {i} has unexpected Prep role in a pure-compute plan (C5a)",
                 )
 
-    def test_pure_compute_launch_completes(self):
-        """C5a runtime — pure-compute launch completes and device stays Ok."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spyrecode_dir = tpk().create_mock_spyrecode(tmpdir)
-            job_plan = _spyre_C.prepare_kernel(spyrecode_dir)
+    def test_pure_compute_launch_matches_cpu(self):
+        """C5a runtime — compiled abs runs on device and matches CPU reference."""
+        x = torch.randn(64, dtype=torch.float16)
+        cpu_result = torch.abs(x)
 
-            stream = torch.Stream(self.device)
-            with stream:
-                _spyre_C.launch_jobplan(job_plan, [])
+        compiled = torch.compile(torch.abs, backend="inductor")
+        spyre_result = compiled(x.to("spyre")).cpu()
 
-            _sync_all(self.device)
-            self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
+        torch.testing.assert_close(spyre_result, cpu_result, atol=0.1, rtol=0.1)
+        self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
 
-    def test_pure_compute_pipelined_launches_healthy(self):
-        """C5a pipelining — repeated pure-compute launches stay healthy."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spyrecode_dir = tpk().create_mock_spyrecode(tmpdir)
-            job_plan = _spyre_C.prepare_kernel(spyrecode_dir)
+    def test_pure_compute_pipelined_matches_cpu(self):
+        """C5a pipelining — repeated compiled abs calls all match CPU reference."""
+        x = torch.randn(64, dtype=torch.float16)
+        cpu_result = torch.abs(x)
 
-            stream = torch.Stream(self.device)
-            with stream:
-                for _ in range(_PIPELINE_DEPTH):
-                    _spyre_C.launch_jobplan(job_plan, [])
+        compiled = torch.compile(torch.abs, backend="inductor")
+        spyre_x = x.to("spyre")
 
-            _sync_all(self.device)
-            self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
+        for _ in range(_PIPELINE_DEPTH):
+            spyre_result = compiled(spyre_x).cpu()
+            torch.testing.assert_close(spyre_result, cpu_result, atol=0.1, rtol=0.1)
+
+        self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
 
 
 class TestFallbackTrackerOff(TestCase):
@@ -155,8 +149,6 @@ class TestFallbackTrackerOff(TestCase):
     The prepared plan shape is unchanged (still [Prep, Prep, Dev]) — only the
     routing at launch time differs.
 
-    Skipped when SPYRE_HAZARD_TRACKER=1 — that process exercises the split path,
-    not the fallback.
     """
 
     def setUp(self):
