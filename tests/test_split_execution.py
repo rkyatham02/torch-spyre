@@ -47,14 +47,21 @@ class TestSplitExecutionStructural(TestCase):
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = tpk().create_mock_spyrecode(
-                tmpdir, exec_command="ComputeOnHost"
+                tmpdir,
+                exec_command="ComputeOnHost",
+                exec_properties={
+                    "ohandle": "output_buffer",
+                    "size": "1024",
+                    "ishape": ["0"],  # fake-symbols path: skips DataConvertInfoGenerate
+                    "ihandle": "",
+                    "hcm": {"vdci": {}, "senConstants": []},
+                },
             )
             job_plan = _spyre_C.prepare_kernel(spyrecode_dir)
 
-            inp = torch.zeros(64, 16, dtype=torch.float16, device=self.device)
             stream = torch.Stream(self.device)
             with stream:
-                _spyre_C.launch_jobplan(job_plan, [inp])
+                _spyre_C.launch_jobplan(job_plan, [])
 
             _sync_all(self.device)
 
