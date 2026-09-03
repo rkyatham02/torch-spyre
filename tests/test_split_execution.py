@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import pickle
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -21,6 +25,16 @@ from torch_spyre import _C as _spyre_C
 from torch.testing._internal.common_utils import TestCase
 
 from test_prepare_kernel import TestPrepareKernel as tpk
+
+# Make the inductor test utilities importable from tests/inductor/.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "inductor"))
+from utils_inductor import _compile_and_run  # noqa: E402
+
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd  # noqa: E402
+from torch_spyre._inductor import spyre_hint  # noqa: E402
+
+# Absolute path to the tests/inductor directory, injected into subprocess sys.path.
+_INDUCTOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inductor")
 
 # Stream ID of S_prep (kHostComputeStreamStartPerDevice = 65 in spyre_stream.cpp).
 _HOST_COMPUTE_STREAM_START = 65
@@ -36,13 +50,222 @@ def _sync_all(device: torch.device) -> None:
     prep.synchronize()
 
 
-class TestAcrossLaunchPipelining(TestCase):
-    """C2 — successive launches pipeline S_prep over S_dev correctly.
+class TestSingleIterationCorrectness(TestCase):
+    """Single tiled abs launch (A÷4) with tracker on: result matches CPU and tracker-off."""
 
-    With the tracker on, launch N+1's HostCompute+H2D can start on S_prep
-    while launch N's Compute is still running on S_dev.  The hazard tracker
-    must ensure each Compute step sees its own H2D's results.
-    """
+    def setUp(self):
+        super().setUp()
+        self.device = torch.device("spyre")
+        if not _spyre_C.get_hazard_tracker_enabled():
+            self.skipTest("Correctness test requires SPYRE_HAZARD_TRACKER=1")
+        torch._dynamo.reset()
+        _pnd.reset()
+
+    def _setup_tiled_input(self, x_cpu):
+        """Move x_cpu to device and attach named dims for A-tiling."""
+        x_dev = x_cpu.to("spyre")
+        _pnd.declare_tensor_dim("A", x_cpu.shape[0])
+        _pnd.declare_tensor_dim("B", x_cpu.shape[1])
+        _pnd.name_tensor_dims(x_dev, ["A", "B"])
+        return x_dev
+
+    def _tiled_abs(self, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.abs(x)
+
+    def test_single_tiled_launch_matches_cpu(self):
+        """Single tiled abs launch result matches CPU — tracker-inserted edge is correct."""
+        torch.manual_seed(0xC0A75E)
+        x_cpu = torch.randn((256, 256), dtype=torch.float16)
+        cpu_result = torch.abs(x_cpu)
+
+        x_dev = self._setup_tiled_input(x_cpu)
+        spyre_result = _compile_and_run(self._tiled_abs, [x_dev], "spyre")
+
+        torch.testing.assert_close(
+            spyre_result.cpu(),
+            cpu_result,
+            atol=0.1,
+            rtol=0.1,
+            msg="Tiled abs differs from CPU — cross-stream H2D→Compute edge may be missing.",
+        )
+        self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
+
+    def test_tracker_on_matches_tracker_off(self):
+        """Same tiled abs: tracker-on result is bit-identical to tracker-off via subprocess."""
+        torch.manual_seed(0xC0A75E)
+        x_cpu = torch.randn((256, 256), dtype=torch.float16)
+
+        # tracker-on result (this process)
+        _pnd.reset()
+        x_dev = self._setup_tiled_input(x_cpu)
+        result_on = _compile_and_run(self._tiled_abs, [x_dev], "spyre").cpu()
+
+        # tracker-off result (subprocess with SPYRE_HAZARD_TRACKER=0)
+        script = (
+            "import sys, os, pickle, torch\n"
+            f"sys.path.insert(0, {_INDUCTOR_DIR!r})\n"
+            "import torch_spyre._inductor.wsr.propagate_named_dims as _pnd\n"
+            "from torch_spyre._inductor import spyre_hint\n"
+            "from utils_inductor import _compile_and_run\n"
+            "x_cpu = pickle.loads(sys.stdin.buffer.read())\n"
+            "_pnd.reset()\n"
+            "x_dev = x_cpu.to('spyre')\n"
+            "_pnd.declare_tensor_dim('A', 256)\n"
+            "_pnd.declare_tensor_dim('B', 256)\n"
+            "_pnd.name_tensor_dims(x_dev, ['A', 'B'])\n"
+            "def fn(x):\n"
+            "    with spyre_hint(num_tiles_per_dim={'A': 4}):\n"
+            "        with spyre_hint(expected_named_dims=['A', 'B']):\n"
+            "            return torch.abs(x)\n"
+            "result = _compile_and_run(fn, [x_dev], 'spyre').cpu()\n"
+            "sys.stdout.buffer.write(pickle.dumps(result))\n"
+        )
+        env = os.environ.copy()
+        env["SPYRE_HAZARD_TRACKER"] = "0"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            input=pickle.dumps(x_cpu),
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"Tracker-off subprocess failed:\n{proc.stderr.decode()}",
+        )
+        result_off = pickle.loads(proc.stdout)
+
+        torch.testing.assert_close(
+            result_on,
+            result_off,
+            atol=0.0,
+            rtol=0.0,
+            msg="Tracker-on and tracker-off results differ — split path produces wrong data.",
+        )
+
+
+class TestWithinLaunchOverlapCorrectness(TestCase):
+    """K-tiled mm (K÷4, 4 prep→compute handoffs per launch): result matches CPU and tracker-off."""
+
+    # M, K, N chosen so K/T is stick-aligned; small scale keeps fp16 error bounded.
+    _M, _K, _N = 64, 512, 32
+
+    def setUp(self):
+        super().setUp()
+        self.device = torch.device("spyre")
+        if not _spyre_C.get_hazard_tracker_enabled():
+            self.skipTest("Within-launch overlap test requires SPYRE_HAZARD_TRACKER=1")
+        torch._dynamo.reset()
+        _pnd.reset()
+
+    def _declare_matmul_dims(self):
+        _pnd.declare_tensor_dim("M", self._M)
+        _pnd.declare_tensor_dim("K", self._K)
+        _pnd.declare_tensor_dim("N", self._N)
+
+    def _setup_matmul_inputs(self, a_cpu, b_cpu):
+        a_dev = a_cpu.to("spyre")
+        b_dev = b_cpu.to("spyre")
+        _pnd.name_tensor_dims(a_dev, ["M", "K"])
+        _pnd.name_tensor_dims(b_dev, ["K", "N"])
+        return a_dev, b_dev
+
+    @staticmethod
+    def _k_tiled_mm(a, b):
+        """mm tiled over K÷4 — emits 4 repeated HostCompute→H2D→Compute handoffs."""
+        _pnd.name_tensor_dims(a, ["M", "K"])
+        _pnd.name_tensor_dims(b, ["K", "N"])
+        with spyre_hint(num_tiles_per_dim={"K": 4}):
+            return torch.mm(a, b)
+
+    def test_k_tiled_matmul_matches_cpu(self):
+        """K-tiled mm result matches CPU — all 4 prep→compute handoffs ordered correctly."""
+        torch.manual_seed(0xAFFE)
+        a_cpu = torch.randn(self._M, self._K, dtype=torch.float16) * 0.01
+        b_cpu = torch.randn(self._K, self._N, dtype=torch.float16) * 0.01
+        cpu_result = torch.mm(a_cpu, b_cpu)
+
+        self._declare_matmul_dims()
+        a_dev, b_dev = self._setup_matmul_inputs(a_cpu, b_cpu)
+        spyre_result = _compile_and_run(self._k_tiled_mm, [a_dev, b_dev], "spyre")
+
+        torch.testing.assert_close(
+            spyre_result.cpu(),
+            cpu_result,
+            atol=0.05,
+            rtol=0.05,
+            msg=(
+                "K-tiled mm differs from CPU — a missing cross-stream edge on one "
+                "of the 4 K-tiles would corrupt the partial accumulation."
+            ),
+        )
+        self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
+
+    def test_k_tiled_matmul_tracker_on_matches_tracker_off(self):
+        """K-tiled mm: tracker-on result is bit-identical to tracker-off via subprocess."""
+        torch.manual_seed(0xAFFE)
+        a_cpu = torch.randn(self._M, self._K, dtype=torch.float16) * 0.01
+        b_cpu = torch.randn(self._K, self._N, dtype=torch.float16) * 0.01
+
+        # tracker-on result (this process)
+        self._declare_matmul_dims()
+        a_dev, b_dev = self._setup_matmul_inputs(a_cpu, b_cpu)
+        result_on = _compile_and_run(self._k_tiled_mm, [a_dev, b_dev], "spyre").cpu()
+
+        # tracker-off result (subprocess)
+        script = (
+            "import sys, os, pickle, torch\n"
+            f"sys.path.insert(0, {_INDUCTOR_DIR!r})\n"
+            "import torch_spyre._inductor.wsr.propagate_named_dims as _pnd\n"
+            "from torch_spyre._inductor import spyre_hint\n"
+            "from utils_inductor import _compile_and_run\n"
+            f"M, K, N = {self._M}, {self._K}, {self._N}\n"
+            "a_cpu, b_cpu = pickle.loads(sys.stdin.buffer.read())\n"
+            "_pnd.reset()\n"
+            "_pnd.declare_tensor_dim('M', M)\n"
+            "_pnd.declare_tensor_dim('K', K)\n"
+            "_pnd.declare_tensor_dim('N', N)\n"
+            "a_dev = a_cpu.to('spyre'); _pnd.name_tensor_dims(a_dev, ['M', 'K'])\n"
+            "b_dev = b_cpu.to('spyre'); _pnd.name_tensor_dims(b_dev, ['K', 'N'])\n"
+            "def fn(a, b):\n"
+            "    _pnd.name_tensor_dims(a, ['M', 'K'])\n"
+            "    _pnd.name_tensor_dims(b, ['K', 'N'])\n"
+            "    with spyre_hint(num_tiles_per_dim={'K': 4}):\n"
+            "        return torch.mm(a, b)\n"
+            "result = _compile_and_run(fn, [a_dev, b_dev], 'spyre').cpu()\n"
+            "sys.stdout.buffer.write(pickle.dumps(result))\n"
+        )
+        env = os.environ.copy()
+        env["SPYRE_HAZARD_TRACKER"] = "0"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            input=pickle.dumps((a_cpu, b_cpu)),
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"Tracker-off subprocess failed:\n{proc.stderr.decode()}",
+        )
+        result_off = pickle.loads(proc.stdout)
+
+        torch.testing.assert_close(
+            result_on,
+            result_off,
+            atol=0.0,
+            rtol=0.0,
+            msg=(
+                "K-tiled mm: tracker-on and tracker-off results differ — "
+                "split path produces wrong partial accumulation."
+            ),
+        )
+
+
+class TestAcrossLaunchPipelining(TestCase):
+    """Split routing smoke test: HostCompute reaches S_prep (DCI error proves it)."""
 
     def setUp(self):
         super().setUp()
@@ -65,12 +288,7 @@ class TestAcrossLaunchPipelining(TestCase):
         return _spyre_C.prepare_kernel(spyrecode_dir)
 
     def test_pipelined_launches_reach_host_compute_step(self):
-        """C2 — each launch routes HostCompute to S_prep (split is active).
-
-        The mock HCM has no real DCI payload so the HostCompute callback raises
-        "Expect one DCI" — that error can only come from HostCompute actually
-        executing on S_prep.  Asserting it proves the split routing happened.
-        """
+        """HostCompute reaches S_prep (split active): mock HCM raises 'Expect one DCI'."""
         with tempfile.TemporaryDirectory() as tmpdir:
             job_plan = self._make_split_plan(tmpdir)
 
@@ -86,16 +304,151 @@ class TestAcrossLaunchPipelining(TestCase):
                     _spyre_C.launch_jobplan(job_plan, [])
 
 
+class TestAcrossLaunchPipeliningCorrectness(TestCase):
+    """N pipelined K-tiled mm launches (different addresses): each matches CPU and tracker-off."""
+
+    _M, _K, _N = 64, 512, 32
+
+    def setUp(self):
+        super().setUp()
+        self.device = torch.device("spyre")
+        if not _spyre_C.get_hazard_tracker_enabled():
+            self.skipTest("Across-launch correctness requires SPYRE_HAZARD_TRACKER=1")
+        torch._dynamo.reset()
+        _pnd.reset()
+
+    def _declare_dims(self):
+        _pnd.declare_tensor_dim("M", self._M)
+        _pnd.declare_tensor_dim("K", self._K)
+        _pnd.declare_tensor_dim("N", self._N)
+
+    @staticmethod
+    def _k_tiled_mm(a, b):
+        _pnd.name_tensor_dims(a, ["M", "K"])
+        _pnd.name_tensor_dims(b, ["K", "N"])
+        with spyre_hint(num_tiles_per_dim={"K": 4}):
+            return torch.mm(a, b)
+
+    def test_pipelined_launches_each_match_cpu(self):
+        """_PIPELINE_DEPTH pipelined launches (no sync between) each match their CPU reference."""
+        torch.manual_seed(0xAFFE)
+        inputs = [
+            (
+                torch.randn(self._M, self._K, dtype=torch.float16) * 0.01,
+                torch.randn(self._K, self._N, dtype=torch.float16) * 0.01,
+            )
+            for _ in range(_PIPELINE_DEPTH)
+        ]
+        cpu_results = [torch.mm(a, b) for a, b in inputs]
+
+        self._declare_dims()
+
+        # Compile once, then fire all launches back-to-back (pipelined).
+        compiled = torch.compile(self._k_tiled_mm, backend="inductor")
+        spyre_results = []
+        for a_cpu, b_cpu in inputs:
+            a_dev = a_cpu.to("spyre")
+            b_dev = b_cpu.to("spyre")
+            _pnd.name_tensor_dims(a_dev, ["M", "K"])
+            _pnd.name_tensor_dims(b_dev, ["K", "N"])
+            spyre_results.append(compiled(a_dev, b_dev))
+
+        # Single sync after all launches — this is what creates the overlap.
+        _sync_all(self.device)
+
+        for i, (spyre_out, cpu_out) in enumerate(zip(spyre_results, cpu_results)):
+            torch.testing.assert_close(
+                spyre_out.cpu(),
+                cpu_out,
+                atol=0.05,
+                rtol=0.05,
+                msg=(
+                    f"Launch {i} result differs from CPU — "
+                    "cross-stream ordering may be wrong for pipelined launches."
+                ),
+            )
+        self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
+
+    def test_pipelined_launches_tracker_on_matches_tracker_off(self):
+        """All N pipelined outputs: tracker-on is bit-identical to tracker-off via subprocess."""
+        torch.manual_seed(0xAFFE)
+        inputs = [
+            (
+                torch.randn(self._M, self._K, dtype=torch.float16) * 0.01,
+                torch.randn(self._K, self._N, dtype=torch.float16) * 0.01,
+            )
+            for _ in range(_PIPELINE_DEPTH)
+        ]
+
+        # tracker-on results (this process)
+        self._declare_dims()
+        compiled = torch.compile(self._k_tiled_mm, backend="inductor")
+        results_on = []
+        for a_cpu, b_cpu in inputs:
+            a_dev = a_cpu.to("spyre")
+            b_dev = b_cpu.to("spyre")
+            _pnd.name_tensor_dims(a_dev, ["M", "K"])
+            _pnd.name_tensor_dims(b_dev, ["K", "N"])
+            results_on.append(compiled(a_dev, b_dev).cpu())
+        _sync_all(self.device)
+
+        # tracker-off results (subprocess)
+        script = (
+            "import sys, os, pickle, torch\n"
+            f"sys.path.insert(0, {_INDUCTOR_DIR!r})\n"
+            "import torch_spyre._inductor.wsr.propagate_named_dims as _pnd\n"
+            "from torch_spyre._inductor import spyre_hint\n"
+            "from utils_inductor import _compile_and_run\n"
+            f"M, K, N, D = {self._M}, {self._K}, {self._N}, {_PIPELINE_DEPTH}\n"
+            "inputs = pickle.loads(sys.stdin.buffer.read())\n"
+            "_pnd.reset()\n"
+            "_pnd.declare_tensor_dim('M', M)\n"
+            "_pnd.declare_tensor_dim('K', K)\n"
+            "_pnd.declare_tensor_dim('N', N)\n"
+            "def fn(a, b):\n"
+            "    _pnd.name_tensor_dims(a, ['M', 'K'])\n"
+            "    _pnd.name_tensor_dims(b, ['K', 'N'])\n"
+            "    with spyre_hint(num_tiles_per_dim={'K': 4}):\n"
+            "        return torch.mm(a, b)\n"
+            "compiled = torch.compile(fn, backend='inductor')\n"
+            "results = []\n"
+            "for a_cpu, b_cpu in inputs:\n"
+            "    a_dev = a_cpu.to('spyre'); _pnd.name_tensor_dims(a_dev, ['M', 'K'])\n"
+            "    b_dev = b_cpu.to('spyre'); _pnd.name_tensor_dims(b_dev, ['K', 'N'])\n"
+            "    results.append(compiled(a_dev, b_dev).cpu())\n"
+            "torch.accelerator.synchronize()\n"
+            "sys.stdout.buffer.write(pickle.dumps(results))\n"
+        )
+        env = os.environ.copy()
+        env["SPYRE_HAZARD_TRACKER"] = "0"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            input=pickle.dumps(inputs),
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"Tracker-off subprocess failed:\n{proc.stderr.decode()}",
+        )
+        results_off = pickle.loads(proc.stdout)
+
+        for i, (r_on, r_off) in enumerate(zip(results_on, results_off)):
+            torch.testing.assert_close(
+                r_on,
+                r_off,
+                atol=0.0,
+                rtol=0.0,
+                msg=(
+                    f"Launch {i}: tracker-on and tracker-off results differ — "
+                    "pipelined split path produces wrong data."
+                ),
+            )
+
+
 class TestFallbackNoPrepSteps(TestCase):
-    """C5a — a pure ComputeOnDevice plan never touches S_prep.
-
-    No Prep-role steps means the router's split branch never fires, regardless
-    of the tracker flag.  Runs in both SPYRE_HAZARD_TRACKER=0 and =1.
-
-    The structural test uses mock SpyreCode (no launch needed).
-    The runtime tests use torch.compile to produce a real binary so the
-    device actually executes the op rather than faulting on a fake pointer.
-    """
+    """Pure ComputeOnDevice plan: no Prep roles, router never splits, result matches CPU."""
 
     def setUp(self):
         super().setUp()
@@ -142,14 +495,7 @@ class TestFallbackNoPrepSteps(TestCase):
 
 
 class TestFallbackTrackerOff(TestCase):
-    """C5b — correction triple with SPYRE_HAZARD_TRACKER=0 runs single-stream on S_dev.
-
-    The router puts every step on S_dev when should_split is False.  S_dev's
-    FIFO ordering enforces H2D→Compute without a cross-stream edge.
-    The prepared plan shape is unchanged (still [Prep, Prep, Dev]) — only the
-    routing at launch time differs.
-
-    """
+    """Tracker off: plan shape unchanged, all steps route to S_dev, HostCompute still fires."""
 
     def setUp(self):
         super().setUp()
@@ -177,8 +523,8 @@ class TestFallbackTrackerOff(TestCase):
                 ["Prep", "Prep", "Dev"],
             )
 
-    def test_correction_triple_launch_completes_tracker_off(self):
-        """C5b runtime — correction triple routed entirely to S_dev completes correctly."""
+    def test_correction_triple_launch_reaches_host_compute_step(self):
+        """HostCompute fires on S_dev (tracker off): mock HCM raises 'Expect one DCI'."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = tpk().create_mock_spyrecode(
                 tmpdir,
@@ -195,39 +541,30 @@ class TestFallbackTrackerOff(TestCase):
 
             stream = torch.Stream(self.device)
             with stream:
-                _spyre_C.launch_jobplan(job_plan, [])
-
-            # Tracker off → S_prep was never touched, only S_dev needs draining.
-            torch.accelerator.synchronize(self.device)
-            self.assertEqual(
-                _spyre_C.get_device_state(),
-                _spyre_C.SpyreDeviceState.Ok,
-                msg="Device entered error state after single-stream launch (C5b).",
-            )
-
-    def test_pipelined_launches_tracker_off_healthy(self):
-        """C5b pipelining — multiple correction-triple launches on S_dev alone."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spyrecode_dir = tpk().create_mock_spyrecode(
-                tmpdir,
-                exec_command="ComputeOnHost",
-                exec_properties={
-                    "ohandle": "output_buffer",
-                    "size": "1024",
-                    "ishape": ["0"],
-                    "ihandle": "",
-                    "hcm": {"vdci": {}, "senConstants": []},
-                },
-            )
-            job_plan = _spyre_C.prepare_kernel(spyrecode_dir)
-
-            stream = torch.Stream(self.device)
-            with stream:
-                for _ in range(_PIPELINE_DEPTH):
+                with self.assertRaisesRegex(RuntimeError, "Expect one DCI"):
                     _spyre_C.launch_jobplan(job_plan, [])
 
-            torch.accelerator.synchronize(self.device)
-            self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
+    def test_pipelined_launches_tracker_off_reach_host_compute_step(self):
+        """C5b pipelining — repeated launches all route HostCompute to S_dev."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = tpk().create_mock_spyrecode(
+                tmpdir,
+                exec_command="ComputeOnHost",
+                exec_properties={
+                    "ohandle": "output_buffer",
+                    "size": "1024",
+                    "ishape": ["0"],
+                    "ihandle": "",
+                    "hcm": {"vdci": {}, "senConstants": []},
+                },
+            )
+            job_plan = _spyre_C.prepare_kernel(spyrecode_dir)
+
+            stream = torch.Stream(self.device)
+            with stream:
+                with self.assertRaisesRegex(RuntimeError, "Expect one DCI"):
+                    for _ in range(_PIPELINE_DEPTH):
+                        _spyre_C.launch_jobplan(job_plan, [])
 
 
 if __name__ == "__main__":
