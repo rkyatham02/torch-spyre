@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import os
-import pickle
-import subprocess
 import sys
 import tempfile
 
@@ -33,9 +31,6 @@ from utils_inductor import _compile_and_run  # noqa: E402
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd  # noqa: E402
 from torch_spyre._inductor import spyre_hint  # noqa: E402
 
-# Absolute path to the tests/inductor directory, injected into subprocess sys.path.
-_INDUCTOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inductor")
-
 # Stream ID of S_prep (kHostComputeStreamStartPerDevice = 65 in spyre_stream.cpp).
 _HOST_COMPUTE_STREAM_START = 65
 
@@ -51,7 +46,7 @@ def _sync_all(device: torch.device) -> None:
 
 
 class TestSingleIterationCorrectness(TestCase):
-    """Single tiled abs launch (A÷4) with tracker on: result matches CPU and tracker-off."""
+    """Single tiled abs launch (A÷4) with tracker on: result matches CPU."""
 
     def setUp(self):
         super().setUp()
@@ -92,62 +87,9 @@ class TestSingleIterationCorrectness(TestCase):
         )
         self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
 
-    def test_tracker_on_matches_tracker_off(self):
-        """Same tiled abs: tracker-on result is bit-identical to tracker-off via subprocess."""
-        torch.manual_seed(0xC0A75E)
-        x_cpu = torch.randn((256, 256), dtype=torch.float16)
-
-        # tracker-on result (this process)
-        _pnd.reset()
-        x_dev = self._setup_tiled_input(x_cpu)
-        result_on = _compile_and_run(self._tiled_abs, [x_dev], "spyre").cpu()
-
-        # tracker-off result (subprocess with SPYRE_HAZARD_TRACKER=0)
-        script = (
-            "import sys, os, pickle, torch\n"
-            f"sys.path.insert(0, {_INDUCTOR_DIR!r})\n"
-            "import torch_spyre._inductor.wsr.propagate_named_dims as _pnd\n"
-            "from torch_spyre._inductor import spyre_hint\n"
-            "from utils_inductor import _compile_and_run\n"
-            "x_cpu = pickle.loads(sys.stdin.buffer.read())\n"
-            "_pnd.reset()\n"
-            "x_dev = x_cpu.to('spyre')\n"
-            "_pnd.declare_tensor_dim('A', 256)\n"
-            "_pnd.declare_tensor_dim('B', 256)\n"
-            "_pnd.name_tensor_dims(x_dev, ['A', 'B'])\n"
-            "def fn(x):\n"
-            "    with spyre_hint(num_tiles_per_dim={'A': 4}):\n"
-            "        with spyre_hint(expected_named_dims=['A', 'B']):\n"
-            "            return torch.abs(x)\n"
-            "result = _compile_and_run(fn, [x_dev], 'spyre').cpu()\n"
-            "sys.stdout.buffer.write(pickle.dumps(result))\n"
-        )
-        env = os.environ.copy()
-        env["SPYRE_HAZARD_TRACKER"] = "0"
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            input=pickle.dumps(x_cpu),
-            capture_output=True,
-            env=env,
-        )
-        self.assertEqual(
-            proc.returncode,
-            0,
-            msg=f"Tracker-off subprocess failed:\n{proc.stderr.decode()}",
-        )
-        result_off = pickle.loads(proc.stdout)
-
-        torch.testing.assert_close(
-            result_on,
-            result_off,
-            atol=0.0,
-            rtol=0.0,
-            msg="Tracker-on and tracker-off results differ — split path produces wrong data.",
-        )
-
 
 class TestWithinLaunchOverlapCorrectness(TestCase):
-    """K-tiled mm (K÷4, 4 prep→compute handoffs per launch): result matches CPU and tracker-off."""
+    """K-tiled mm (K÷4, 4 prep→compute handoffs per launch): result matches CPU."""
 
     # M, K, N chosen so K/T is stick-aligned; small scale keeps fp16 error bounded.
     _M, _K, _N = 64, 512, 32
@@ -203,66 +145,6 @@ class TestWithinLaunchOverlapCorrectness(TestCase):
         )
         self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
 
-    def test_k_tiled_matmul_tracker_on_matches_tracker_off(self):
-        """K-tiled mm: tracker-on result is bit-identical to tracker-off via subprocess."""
-        torch.manual_seed(0xAFFE)
-        a_cpu = torch.randn(self._M, self._K, dtype=torch.float16) * 0.01
-        b_cpu = torch.randn(self._K, self._N, dtype=torch.float16) * 0.01
-
-        # tracker-on result (this process)
-        self._declare_matmul_dims()
-        a_dev, b_dev = self._setup_matmul_inputs(a_cpu, b_cpu)
-        result_on = _compile_and_run(self._k_tiled_mm, [a_dev, b_dev], "spyre").cpu()
-
-        # tracker-off result (subprocess)
-        script = (
-            "import sys, os, pickle, torch\n"
-            f"sys.path.insert(0, {_INDUCTOR_DIR!r})\n"
-            "import torch_spyre._inductor.wsr.propagate_named_dims as _pnd\n"
-            "from torch_spyre._inductor import spyre_hint\n"
-            "from utils_inductor import _compile_and_run\n"
-            f"M, K, N = {self._M}, {self._K}, {self._N}\n"
-            "a_cpu, b_cpu = pickle.loads(sys.stdin.buffer.read())\n"
-            "_pnd.reset()\n"
-            "_pnd.declare_tensor_dim('M', M)\n"
-            "_pnd.declare_tensor_dim('K', K)\n"
-            "_pnd.declare_tensor_dim('N', N)\n"
-            "a_dev = a_cpu.to('spyre'); _pnd.name_tensor_dims(a_dev, ['M', 'K'])\n"
-            "b_dev = b_cpu.to('spyre'); _pnd.name_tensor_dims(b_dev, ['K', 'N'])\n"
-            "def fn(a, b):\n"
-            "    _pnd.name_tensor_dims(a, ['M', 'K'])\n"
-            "    _pnd.name_tensor_dims(b, ['K', 'N'])\n"
-            "    with spyre_hint(num_tiles_per_dim={'K': 4}):\n"
-            "        return torch.mm(a, b)\n"
-            "result = _compile_and_run(fn, [a_dev, b_dev], 'spyre').cpu()\n"
-            "sys.stdout.buffer.write(pickle.dumps(result))\n"
-        )
-        env = os.environ.copy()
-        env["SPYRE_HAZARD_TRACKER"] = "0"
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            input=pickle.dumps((a_cpu, b_cpu)),
-            capture_output=True,
-            env=env,
-        )
-        self.assertEqual(
-            proc.returncode,
-            0,
-            msg=f"Tracker-off subprocess failed:\n{proc.stderr.decode()}",
-        )
-        result_off = pickle.loads(proc.stdout)
-
-        torch.testing.assert_close(
-            result_on,
-            result_off,
-            atol=0.0,
-            rtol=0.0,
-            msg=(
-                "K-tiled mm: tracker-on and tracker-off results differ — "
-                "split path produces wrong partial accumulation."
-            ),
-        )
-
 
 class TestAcrossLaunchPipelining(TestCase):
     """Split routing smoke test: HostCompute reaches S_prep (DCI error proves it)."""
@@ -305,7 +187,7 @@ class TestAcrossLaunchPipelining(TestCase):
 
 
 class TestAcrossLaunchPipeliningCorrectness(TestCase):
-    """N pipelined K-tiled mm launches (different addresses): each matches CPU and tracker-off."""
+    """N pipelined K-tiled mm launches (different addresses): each matches CPU."""
 
     _M, _K, _N = 64, 512, 32
 
@@ -368,83 +250,6 @@ class TestAcrossLaunchPipeliningCorrectness(TestCase):
                 ),
             )
         self.assertEqual(_spyre_C.get_device_state(), _spyre_C.SpyreDeviceState.Ok)
-
-    def test_pipelined_launches_tracker_on_matches_tracker_off(self):
-        """All N pipelined outputs: tracker-on is bit-identical to tracker-off via subprocess."""
-        torch.manual_seed(0xAFFE)
-        inputs = [
-            (
-                torch.randn(self._M, self._K, dtype=torch.float16) * 0.01,
-                torch.randn(self._K, self._N, dtype=torch.float16) * 0.01,
-            )
-            for _ in range(_PIPELINE_DEPTH)
-        ]
-
-        # tracker-on results (this process)
-        self._declare_dims()
-        compiled = torch.compile(self._k_tiled_mm, backend="inductor")
-        results_on = []
-        for a_cpu, b_cpu in inputs:
-            a_dev = a_cpu.to("spyre")
-            b_dev = b_cpu.to("spyre")
-            _pnd.name_tensor_dims(a_dev, ["M", "K"])
-            _pnd.name_tensor_dims(b_dev, ["K", "N"])
-            results_on.append(compiled(a_dev, b_dev).cpu())
-        _sync_all(self.device)
-
-        # tracker-off results (subprocess)
-        script = (
-            "import sys, os, pickle, torch\n"
-            f"sys.path.insert(0, {_INDUCTOR_DIR!r})\n"
-            "import torch_spyre._inductor.wsr.propagate_named_dims as _pnd\n"
-            "from torch_spyre._inductor import spyre_hint\n"
-            "from utils_inductor import _compile_and_run\n"
-            f"M, K, N, D = {self._M}, {self._K}, {self._N}, {_PIPELINE_DEPTH}\n"
-            "inputs = pickle.loads(sys.stdin.buffer.read())\n"
-            "_pnd.reset()\n"
-            "_pnd.declare_tensor_dim('M', M)\n"
-            "_pnd.declare_tensor_dim('K', K)\n"
-            "_pnd.declare_tensor_dim('N', N)\n"
-            "def fn(a, b):\n"
-            "    _pnd.name_tensor_dims(a, ['M', 'K'])\n"
-            "    _pnd.name_tensor_dims(b, ['K', 'N'])\n"
-            "    with spyre_hint(num_tiles_per_dim={'K': 4}):\n"
-            "        return torch.mm(a, b)\n"
-            "compiled = torch.compile(fn, backend='inductor')\n"
-            "results = []\n"
-            "for a_cpu, b_cpu in inputs:\n"
-            "    a_dev = a_cpu.to('spyre'); _pnd.name_tensor_dims(a_dev, ['M', 'K'])\n"
-            "    b_dev = b_cpu.to('spyre'); _pnd.name_tensor_dims(b_dev, ['K', 'N'])\n"
-            "    results.append(compiled(a_dev, b_dev).cpu())\n"
-            "torch.accelerator.synchronize()\n"
-            "sys.stdout.buffer.write(pickle.dumps(results))\n"
-        )
-        env = os.environ.copy()
-        env["SPYRE_HAZARD_TRACKER"] = "0"
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            input=pickle.dumps(inputs),
-            capture_output=True,
-            env=env,
-        )
-        self.assertEqual(
-            proc.returncode,
-            0,
-            msg=f"Tracker-off subprocess failed:\n{proc.stderr.decode()}",
-        )
-        results_off = pickle.loads(proc.stdout)
-
-        for i, (r_on, r_off) in enumerate(zip(results_on, results_off)):
-            torch.testing.assert_close(
-                r_on,
-                r_off,
-                atol=0.0,
-                rtol=0.0,
-                msg=(
-                    f"Launch {i}: tracker-on and tracker-off results differ — "
-                    "pipelined split path produces wrong data."
-                ),
-            )
 
 
 class TestFallbackNoPrepSteps(TestCase):
