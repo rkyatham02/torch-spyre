@@ -285,7 +285,29 @@ def _get_coordinate_mask(
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
-    mask_pointwise = op in _POINTWISE_PADDING_MASK_VALUE
+    #
+    # SAMV coordinate masking is limited to <=16-bit element types by the
+    # backend compiler ("Coordinate masking is supported only up to 16bit
+    # element types"), so the pointwise padding mask cannot be emitted for FP32.
+    # Skipping it is what lets unaligned FP32 `exp` compile at all.
+    #
+    # Risk: the padded lanes of an unaligned FP32 `exp` output hold
+    # `exp(uninitialized)`, so any consumer that ITERATES the padded extent may
+    # produce unexpected results -- a contraction does, since it reads the whole
+    # stick as an operand. Note a restickify also iterates the padded extent and
+    # emits no mask, so the values are relocated rather than dropped; they stay
+    # harmless only as long as the eventual consumer iterates the logical extent.
+    # Known use cases do not hit this limitation:
+    #   * SDPA (softmax -> matmul, the consumer the mask was added for, #3248)
+    #     runs in fp16, where the mask is still applied.
+    #   * The Gemma-4 MoE router (softmax with dtype=torch.float32 -> topk) uses
+    #     stick-aligned tensors, so there are no padded lanes to begin with.
+    # Revisit if either assumption changes. See #3799 (SAMV masking for exp) and
+    # #3290 (padded-stick-state layout enum, the principled replacement for this
+    # bandage).
+    mask_pointwise = (
+        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+    )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
@@ -297,6 +319,27 @@ def _get_coordinate_mask(
 
 def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
+
+
+def _unambiguous_physical_axis(
+    arg: TensorArg, dim: Symbol, symbol_mapping: dict
+) -> int | None:
+    """Return the sole physical axis carrying ``dim``, if there is one.
+
+    Coarse tiling can leave a constant physical axis in ``device_size`` after
+    its loop role has moved to a ``LoopSpec``. Positional alignment between
+    the remaining logical dimensions and physical axes is then invalid. A
+    non-stick dimension with one coordinate dependency still has an
+    unambiguous physical axis, which is authoritative for its extent and
+    stride. Factorized dimensions intentionally return ``None`` here and keep
+    the established positional handling.
+    """
+    positions = [
+        index
+        for index, coordinate in enumerate(arg.device_coordinates[:-1])
+        if dim in coordinate.subs(symbol_mapping).free_symbols
+    ]
+    return positions[0] if len(positions) == 1 else None
 
 
 # SDSC dim labels for the conv2d padding (output-spatial) and window (kernel)
@@ -1217,6 +1260,7 @@ def _create_sdsc_tensors(
         # tile_size; the full extent is that tile_size times every level's
         # supertile_count for that dim.
         sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {}
+        tiled_constant_axes: set[int] = set()
         if arg.device_tile_advance_expr is not None:
             arg_elem_bytes = num_bytes(arg.device_dtype)
             for level_syms in op_spec.tiled_symbols:
@@ -1230,6 +1274,32 @@ def _create_sdsc_tensors(
                     trip_count = op_spec.tiled_symbol_trip_counts.get(sym, 1)
                     sdsc_sym = symbol_mapping[sym]
                     sdsc_dim_advance[sdsc_sym] = (tile_size, trip_count)
+                    element_advance = int(coeff)
+                    candidates = [
+                        axis
+                        for axis, coordinate in enumerate(arg.device_coordinates[:-1])
+                        if int(arg.device_size[axis]) > 1
+                        and not coordinate.subs(symbol_mapping).free_symbols
+                        and math.prod(arg.device_size[axis + 1 :]) == element_advance
+                    ]
+                    if len(candidates) == 1:
+                        tiled_constant_axes.add(candidates[0])
+
+        # A loop dimension tiled down to one disappears from the op's
+        # iteration space but may remain as a non-unit constant axis in the
+        # backing device layout. Fold that axis into the next inner logical
+        # dimension so SDSC emits the required gap between repetitions of the
+        # next outer role. The tile-advance coefficient identifies precisely
+        # which constant axis belongs to the surrounding LoopSpec.
+        gap_factor_by_inner_axis: dict[int, int] = {}
+        for tiled_axis in tiled_constant_axes:
+            for inner_axis in range(tiled_axis + 1, len(arg.device_coordinates) - 1):
+                coordinate = arg.device_coordinates[inner_axis].subs(symbol_mapping)
+                if coordinate.free_symbols:
+                    gap_factor_by_inner_axis[inner_axis] = gap_factor_by_inner_axis.get(
+                        inner_axis, 1
+                    ) * int(arg.device_size[tiled_axis])
+                    break
 
         scales: dict = {}
         strides: dict = {}
@@ -1298,6 +1368,14 @@ def _create_sdsc_tensors(
 
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
+            if dim is not stick_dim:
+                # A tiled-away loop role may survive as a constant physical
+                # axis. Locate every other role by coordinate identity so the
+                # constant slot cannot shift an outer role onto the wrong
+                # device extent (notably Hkv in native GQA with D=128).
+                physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
+            else:
+                physical_axis = None
 
             if has_indirect_access and (
                 i in index_tensor_indices or is_indirect_value_tensor(arg)
@@ -1310,17 +1388,28 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
 
+            if physical_axis is not None:
+                # Coarse-tiled layouts may contain constant physical axes that
+                # have no live loop role. Use the role's actual coordinate
+                # position so those axes contribute to its physical stride
+                # without being mistaken for a neighboring logical role.
+                physical_gap_factor = gap_factor_by_inner_axis.get(physical_axis, 1)
+                strides[dim] = (
+                    math.prod(arg.device_size[physical_axis:]) * physical_gap_factor
+                )
+                dim_device_stride = math.prod(arg.device_size[physical_axis + 1 :])
             # Injected stick dims don't exist in device_size; use stride=1.
-            if (
+            elif (
                 has_indirect_access
                 and i in index_tensor_indices
                 and dim in (index_stick_syms.values() if index_stick_syms else [])
             ):
                 strides[dim] = 1
+                dim_device_stride = 1
             else:
                 strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
+                dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
             offsets[dim] = 0
-            dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
             if dim is stick_dim and dim in sdsc_dim_advance:
                 # Authoritative fact from coarse_tile.py: the stick dim's
@@ -1353,7 +1442,11 @@ def _create_sdsc_tensors(
                 # enough unit dims are squeezed out; fall back to the iteration
                 # extent, which skips the padding corrections below.
                 size_idx = -stride_idx - 2
-                if -size_idx > len(arg.device_size):
+                if physical_axis is not None:
+                    dev_dim_size = arg.device_size[
+                        physical_axis
+                    ] * gap_factor_by_inner_axis.get(physical_axis, 1)
+                elif -size_idx > len(arg.device_size):
                     dev_dim_size = iteration_space[dim]
                 else:
                     dev_dim_size = arg.device_size[size_idx]
@@ -1382,10 +1475,13 @@ def _create_sdsc_tensors(
             # Same out-of-range case as the device_size lookup above: such a dim
             # has no device coordinate either, and this subscript would raise
             # before the size comparison below could skip it.
-            coord_idx = -stride_idx - 2
+            coord_idx = physical_axis if physical_axis is not None else -stride_idx - 2
             dim_coord = (
                 arg.device_coordinates[coord_idx]
-                if -coord_idx <= len(arg.device_coordinates)
+                if (
+                    physical_axis is not None
+                    or -coord_idx <= len(arg.device_coordinates)
+                )
                 else None
             )
             if (
@@ -1837,7 +1933,7 @@ def _finalize_tensor_work_divisions(
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
-    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args)
+    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)

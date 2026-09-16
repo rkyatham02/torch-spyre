@@ -26,6 +26,7 @@ import torch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
@@ -69,6 +70,30 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         GraphLowering._update_scheduler(graph)
 
     assert calls == [graph]
+
+
+def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
+    """Unsupported paired plans remain fail-closed under ``python -O``."""
+
+    import torch_spyre._inductor.cost_model as cost_model_module
+    import torch_spyre._inductor.scratchpad.allocator as allocator_module
+
+    solver = SimpleNamespace(
+        buffers=[],
+        plan_layout_and_core_divisions=lambda _cost: [
+            SimpleNamespace(lx_relayout_plans=[object()])
+        ],
+    )
+    graph = SimpleNamespace(operations=[])
+    with (
+        patch.object(allocator_module, "CoreDivisionLayoutSolver", object),
+        patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
+        patch.object(cost_model_module, "predict_by_bundle", return_value=0),
+        unittest.TestCase().assertRaisesRegex(
+            AssertionError, "CoOptimizingAllocator does not support LX relayout"
+        ),
+    ):
+        allocator_module.CoOptimizingAllocator._solve(SimpleNamespace(), solver, graph)
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -159,6 +184,8 @@ class BaseTestScratchpadUsage(unittest.TestCase):
                 buf_name = op.name
                 buffer = graph.get_buffer(buf_name)
                 layout = buffer.get_layout()
+                if isinstance(layout, MutationLayoutSHOULDREMOVE):
+                    layout = layout.real_layout()
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
                 mem_usages[buf_name] = {
@@ -509,6 +536,31 @@ class TestCloneAtGraphBoundaries(
     directly.
     """
 
+    # Solvers that ``select_allocator`` drives with the symbolic cost expression.
+    # The rest reach CoOptimizingAllocator too, but wrapped in
+    # ExhaustiveSearchSolver, which enumerates divisions instead of building that
+    # expression -- so the graph-boundary charge never reaches them and they still
+    # clone. (Without ortools ``cpsat`` takes the enumerating path as well; the
+    # cost of over-skipping there is this one assertion.)
+    _COST_MODEL_SOLVERS = frozenset({"cpsat", "simulated_annealing"})
+
+    def assert_input_clone_added(self, n_ops_no_lx, n_ops_with_lx, msg):
+        """Assert LX planning inserted the graph-input clone -- except where the cost
+        model is what decides, and prices it at exactly zero.
+
+        Every model here reads ``x`` from a single bundle, where ``_fused_hbm_bytes``
+        already counts that load once and the graph-boundary charge (#4271) keeps it
+        whether or not ``x`` is resident. The clone therefore moves no bytes, and a
+        co-optimizer that scores it is free to skip it. What must hold either way --
+        LX is still used, the numbers are still right -- each model asserts for itself.
+        """
+        if (
+            ts_inductor_config.co_optimizing_lx_planning
+            and ts_inductor_config.layout_solver in self._COST_MODEL_SOLVERS
+        ):
+            return
+        self.assertGreater(n_ops_with_lx, n_ops_no_lx, msg)
+
     def _input_clone_when_read_by_multiple_ops(self):
         """A graph input read by two different ops is cloned; the clone lands in LX."""
         x = self.rand_device((64, 1024))
@@ -525,9 +577,9 @@ class TestCloneAtGraphBoundaries(
             n_ops_no_lx,
             mem_usages_no_lx,
         ):
-            self.assertGreater(
-                n_ops_with_lx,
+            self.assert_input_clone_added(
                 n_ops_no_lx,
+                n_ops_with_lx,
                 f"Expected the input clone to add an op: {n_ops_no_lx} ops without LX, "
                 f"{n_ops_with_lx} with LX",
             )
@@ -622,10 +674,10 @@ class TestCloneAtGraphBoundaries(
         """A graph input read by a reduction is LX-cloned, with the clone's
         per-core split re-keyed correctly.
 
-        push_allocation_with_clone re-keys the consumer's op_it_space_splits
-        through the buffer's strides before assigning them to the clone. A reduction consumer's split is keyed to its
-        reduced-shape output; copied verbatim it would split the wrong axis of
-        the full-shape clone (wrong values / SDSC abort at multi-core). The
+        push_allocation_with_clone projects the accepted physical view through
+        the clone's own coordinates and commits that complete division. Copying
+        a reduction consumer's logical split verbatim could split the wrong axis
+        of the full-shape clone (wrong values / SDSC abort at multi-core). The
         numerical failure only manifests when work is split across cores; here
         (sencores=1) we assert the clone is inserted and the result is correct.
         Multi-core numerical coverage lives in
@@ -645,9 +697,9 @@ class TestCloneAtGraphBoundaries(
             n_ops_no_lx,
             mem_usages_no_lx,
         ):
-            self.assertGreater(
-                n_ops_with_lx,
+            self.assert_input_clone_added(
                 n_ops_no_lx,
+                n_ops_with_lx,
                 "Expected a boundary clone for the reduction-fed input, but the op "
                 f"count did not grow ({n_ops_no_lx} -> {n_ops_with_lx})",
             )
