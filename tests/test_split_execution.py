@@ -14,6 +14,7 @@
 
 """Split-execution parity tests (no profiler required)."""
 
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -36,7 +37,6 @@ _PIPELINE_DEPTH = 4  # number of back-to-back launches for parity tests
 # ── subprocess environment variable keys ─────────────────────────────────────
 _ENV_RESULT = "SPYRE_RESULT_PATH"
 _ENV_TRACKER = "SPYRE_HAZARD_TRACKER"
-_ENV_CACHE_DIR = "SPYRE_CACHE_DIR_OVERRIDE"
 _ENV_SHIFTED = "SPYRE_SHIFTED_ORDER"
 
 # ── shapes ────────────────────────────────────────────────────────────────────
@@ -140,12 +140,12 @@ def _run_child(
     cache_dir: str | None = None,
     shifted: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Spawn a child pytest process that runs exactly ``child_name``."""
+    """Spawn a child process that runs exactly ``child_name``."""
     env = os.environ.copy()
     env[_ENV_TRACKER] = str(tracker)
     env[_ENV_RESULT] = result_path
     if cache_dir is not None:
-        env[_ENV_CACHE_DIR] = cache_dir
+        env["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
         # Force single CPU so both modes always produce the same program.
         env["SPYRE_NUM_CPUS"] = "1"
     if shifted:
@@ -153,13 +153,7 @@ def _run_child(
     proc = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "pytest",
             __file__,
-            "-q",
-            "--no-header",
-            "--tb=short",
-            "-k",
             child_name,
         ],
         env=env,
@@ -167,6 +161,7 @@ def _run_child(
         text=True,
         cwd=os.path.dirname(__file__),
         timeout=300,
+        check=False,
     )
     if proc.returncode != 0:
         raise AssertionError(
@@ -203,29 +198,22 @@ def _collect_parity(
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"Child for '{child_name}' ({label}) exited 0 but never wrote "
-                f"{path!r} — the child test was probably skipped entirely."
+                f"{path!r} — the child workload failed to produce output."
             )
     off = torch.load(off_path, weights_only=True)
     on = torch.load(on_path, weights_only=True)
     return off, on
 
 
-def _is_child() -> bool:
-    return bool(os.environ.get(_ENV_RESULT))
-
-
 # ── child workloads ───────────────────────────────────────────────────────────
 
 
-def test_child_single_mm() -> None:
+def _child_single_mm() -> None:
     """Child: single K-tiled mm, saves [result_cpu].
 
     C3 – one launch with tracker on/off; checks plan shape and correctness.
     Also exercises S_prep routing check (C2) after the one launch.
     """
-    if not _is_child():
-        pytest.skip("orchestrator test — not run directly")
-
     torch._dynamo.reset()
     _pnd.reset()
 
@@ -263,15 +251,12 @@ def test_child_single_mm() -> None:
     torch.save([result.cpu()], os.environ[_ENV_RESULT])
 
 
-def test_child_pipelined_mm() -> None:
+def _child_pipelined_mm() -> None:
     """Child: _PIPELINE_DEPTH K-tiled mm launches, saves [result_cpu, ...].
 
     C1b – back-to-back launches; shifted order for tracker-on.
     C2  – S_prep routing checked after every launch.
     """
-    if not _is_child():
-        pytest.skip("orchestrator test — not run directly")
-
     torch._dynamo.reset()
     _pnd.reset()
 
@@ -322,7 +307,7 @@ def test_child_pipelined_mm() -> None:
     torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
 
 
-def test_child_host_ahead() -> None:
+def _child_host_ahead() -> None:
     """Child: _HOST_AHEAD_PAIRS+1 large-shape launches; records host timestamps.
 
     Saves a dict with keys:
@@ -333,9 +318,6 @@ def test_child_host_ahead() -> None:
     The parent test uses host_ns[k+1] < time-when-dev-became-idle-after-launch-k
     to verify host ran ahead of the device.
     """
-    if not _is_child():
-        pytest.skip("orchestrator test — not run directly")
-
     torch._dynamo.reset()
     _pnd.reset()
 
@@ -401,10 +383,7 @@ class TestSingleLaunchParity:
         partial accumulation.  Tracker-off falls back to single-stream so both
         paths must agree to the bit.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
-        results_off, results_on = _collect_parity(tmp_path, "test_child_single_mm")
+        results_off, results_on = _collect_parity(tmp_path, "single_mm")
 
         torch.testing.assert_close(
             results_on[0],
@@ -425,9 +404,6 @@ class TestSingleLaunchParity:
         atol=0.1 would pass an all-zero output, so we use relative Frobenius
         norm ≤ 5e-3 (measured: 2.5e-3–3.7e-3 on this shape).
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         torch.manual_seed(0xAFFE)
         M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
         a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
@@ -437,7 +413,7 @@ class TestSingleLaunchParity:
         cache_dir = str(tmp_path / "cache")
         os.makedirs(cache_dir, exist_ok=True)
         on_path = str(tmp_path / "on.pt")
-        _run_child(1, on_path, "test_child_single_mm", cache_dir=cache_dir)
+        _run_child(1, on_path, "single_mm", cache_dir=cache_dir)
 
         result = torch.load(on_path, weights_only=True)[0].float()
         rel_err = (result - ref).norm() / (ref.norm() + 1e-8)
@@ -459,11 +435,8 @@ class TestPipelinedLaunchParity:
         WAR edge would let H2D for launch k+1 overwrite the correction buffer
         while launch k's Compute still reads it, corrupting the result.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         results_off, results_on = _collect_parity(
-            tmp_path, "test_child_pipelined_mm", shifted_on=True
+            tmp_path, "pipelined_mm", shifted_on=True
         )
 
         # tracker-on[slot] computed pair (slot+1)%n.
@@ -491,18 +464,13 @@ class TestPipelinedLaunchParity:
         programs, making all parity checks meaningless.  We fingerprint the
         first spyreCodeDir written into the shared cache.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
-        import hashlib
-
         cache_dir = str(tmp_path / "cache")
         os.makedirs(cache_dir, exist_ok=True)
 
         off_path = str(tmp_path / "off.pt")
         on_path = str(tmp_path / "on.pt")
-        _run_child(0, off_path, "test_child_single_mm", cache_dir=cache_dir)
-        _run_child(1, on_path, "test_child_single_mm", cache_dir=cache_dir)
+        _run_child(0, off_path, "single_mm", cache_dir=cache_dir)
+        _run_child(1, on_path, "single_mm", cache_dir=cache_dir)
 
         # Walk all spyrecode.json files under the cache and hash them.
         def _fingerprint(root: str) -> dict[str, str]:
@@ -545,13 +513,10 @@ class TestHostAheadOfDevice:
         started.  At least _HOST_AHEAD_MIN_FRACTION of the
         (_HOST_AHEAD_PAIRS) consecutive pairs must satisfy this.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         cache_dir = str(tmp_path / "cache")
         os.makedirs(cache_dir, exist_ok=True)
         on_path = str(tmp_path / "on.pt")
-        _run_child(1, on_path, "test_child_host_ahead", cache_dir=cache_dir)
+        _run_child(1, on_path, "host_ahead", cache_dir=cache_dir)
 
         data = torch.load(on_path, weights_only=False)
         host_ns: list[int] = data["host_ns"]
@@ -574,5 +539,15 @@ class TestHostAheadOfDevice:
         )
 
 
+_CHILD_DISPATCH = {
+    "single_mm": _child_single_mm,
+    "pipelined_mm": _child_pipelined_mm,
+    "host_ahead": _child_host_ahead,
+}
+
+
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    if len(sys.argv) > 1 and sys.argv[1] in _CHILD_DISPATCH:
+        _CHILD_DISPATCH[sys.argv[1]]()
+    else:
+        pytest.main([__file__, "-v"])

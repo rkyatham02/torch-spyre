@@ -56,10 +56,6 @@ def _sync_all(device: torch.device) -> None:
     ).synchronize()
 
 
-def _is_child() -> bool:
-    return bool(os.environ.get(_ENV_RESULT))
-
-
 def _assert_finite(event: dict, field: str) -> float:
     val = event.get(field)
     name = event.get("name", "unknown")
@@ -140,18 +136,12 @@ def _correct_skew(
 # ── child workload ────────────────────────────────────────────────────────────
 
 
-def test_child_trace_workload() -> None:
+def _child_trace_workload() -> None:
     """Child: warm up, then profile _N_LAUNCHES K-tiled mm launches.
 
     Requires USE_SPYRE_PROFILER=1.  Writes Chrome trace to SPYRE_TRACE_PATH
     and result tensors to SPYRE_RESULT_PATH.
     """
-    if not _is_child():
-        pytest.skip("orchestrator test — not run directly")
-
-    if os.environ.get("USE_SPYRE_PROFILER") != "1":
-        pytest.skip("requires USE_SPYRE_PROFILER=1")
-
     from torch.profiler import ProfilerActivity, profile
 
     torch._dynamo.reset()
@@ -233,20 +223,15 @@ def _run_trace_child(
     proc = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "pytest",
             __file__,
-            "-q",
-            "--no-header",
-            "--tb=short",
-            "-k",
-            "test_child_trace_workload",
+            "trace_workload",
         ],
         env=env,
         capture_output=True,
         text=True,
         cwd=os.path.dirname(__file__),
         timeout=300,
+        check=False,
     )
     if proc.returncode != 0:
         raise AssertionError(
@@ -287,9 +272,6 @@ class TestSplitExecutionTrace:
         If this assertion fails, #3488 (host compute off the calling thread)
         has landed and the host-ahead checks below need a new span name.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         trace, _ = self._load_trace(tmp_path, tracker=1)
         events = trace.get("traceEvents", [])
         hc_spans = _cpu_spans_named(events, "launch::HostCompute")
@@ -308,9 +290,6 @@ class TestSplitExecutionTrace:
         The check uses corrected device timestamps (skew ≤ ±100 µs after
         correction).
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         trace, _ = self._load_trace(tmp_path, tracker=1)
         raw_events = trace.get("traceEvents", [])
 
@@ -398,12 +377,9 @@ class TestSplitExecutionTrace:
         flex inserts a RAW dependency: Compute reads the correction that H2D
         wrote.  If this check fails, the RAW edge is missing.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         trace, _ = self._load_trace(tmp_path, tracker=1)
         raw_events = trace.get("traceEvents", [])
-        events, skew_us = _correct_skew(raw_events)
+        events, _skew_us = _correct_skew(raw_events)
 
         h2ds = sorted(
             [
@@ -458,12 +434,9 @@ class TestSplitExecutionTrace:
         that Compute k is still reading.  This is why H2D/kernel temporal
         overlap is impossible and the old overlap test was wrong.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         trace, _ = self._load_trace(tmp_path, tracker=1)
         raw_events = trace.get("traceEvents", [])
-        events, skew_us = _correct_skew(raw_events)
+        events, _skew_us = _correct_skew(raw_events)
 
         h2ds = sorted(
             [
@@ -520,9 +493,6 @@ class TestSplitExecutionTrace:
         Relative Frobenius ≤ 5e-3.  A tracker bug that silently zeros or
         corrupts outputs would produce a much larger error.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         _, results = self._load_trace(tmp_path, tracker=1)
 
         torch.manual_seed(0xAFFE)
@@ -546,9 +516,6 @@ class TestSplitExecutionTrace:
         data is printed so that reviewers can compare overlap counts between
         modes when inspecting CI logs.
         """
-        if _is_child():
-            pytest.skip("orchestrator test — not run directly")
-
         trace, results = self._load_trace(tmp_path, tracker=0)
         raw_events = trace.get("traceEvents", [])
         events, skew_us = _correct_skew(raw_events)
@@ -584,5 +551,13 @@ class TestSplitExecutionTrace:
         )
 
 
+_CHILD_DISPATCH = {
+    "trace_workload": _child_trace_workload,
+}
+
+
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    if len(sys.argv) > 1 and sys.argv[1] in _CHILD_DISPATCH:
+        _CHILD_DISPATCH[sys.argv[1]]()
+    else:
+        pytest.main([__file__, "-v"])
