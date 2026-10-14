@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import json
 import math
 import os
 import pathlib
 import subprocess
 import sys
+import time
 
 import pytest
 import torch
@@ -54,6 +56,13 @@ def _sync_all(device: torch.device) -> None:
     torch_spyre._C.host_compute_stream_by_id(
         _HOST_COMPUTE_STREAM_ID, device
     ).synchronize()
+
+
+def _cleanup_device(device: torch.device) -> None:
+    with contextlib.suppress(Exception):
+        _sync_all(device)
+    with contextlib.suppress(Exception):
+        torch_spyre._C.free_runtime()
 
 
 def _assert_finite(event: dict, field: str) -> float:
@@ -133,7 +142,7 @@ def _correct_skew(
     return corrected, skew_us
 
 
-# ── child workload ────────────────────────────────────────────────────────────
+# ── child workload ────────────────────────────────────────────────────
 
 
 def _child_trace_workload() -> None:
@@ -144,62 +153,65 @@ def _child_trace_workload() -> None:
     """
     from torch.profiler import ProfilerActivity, profile
 
-    torch._dynamo.reset()
-    _pnd.reset()
-
-    M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
     device = torch.device("spyre")
+    try:
+        torch._dynamo.reset()
+        _pnd.reset()
 
-    torch.manual_seed(0xAFFE)
-    inputs_cpu = [
-        (
-            torch.randn(M, K, dtype=torch.float16) * 0.01,
-            torch.randn(K, N, dtype=torch.float16) * 0.01,
-        )
-        for _ in range(_N_LAUNCHES)
-    ]
+        M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
 
-    _pnd.declare_tensor_dim("M", M)
-    _pnd.declare_tensor_dim("K", K)
-    _pnd.declare_tensor_dim("N", N)
+        torch.manual_seed(0xAFFE)
+        inputs_cpu = [
+            (
+                torch.randn(M, K, dtype=torch.float16) * 0.01,
+                torch.randn(K, N, dtype=torch.float16) * 0.01,
+            )
+            for _ in range(_N_LAUNCHES)
+        ]
 
-    def k_tiled_mm(a, b):
-        _pnd.name_tensor_dims(a, ["M", "K"])
-        _pnd.name_tensor_dims(b, ["K", "N"])
-        with spyre_hint(num_tiles_per_dim={"K": _K_TILES}):
-            return torch.mm(a, b)
+        _pnd.declare_tensor_dim("M", M)
+        _pnd.declare_tensor_dim("K", K)
+        _pnd.declare_tensor_dim("N", N)
 
-    compiled = torch.compile(k_tiled_mm, backend="inductor")
+        def k_tiled_mm(a, b):
+            _pnd.name_tensor_dims(a, ["M", "K"])
+            _pnd.name_tensor_dims(b, ["K", "N"])
+            with spyre_hint(num_tiles_per_dim={"K": _K_TILES}):
+                return torch.mm(a, b)
 
-    inputs_dev = []
-    for a_cpu, b_cpu in inputs_cpu:
-        a_dev = a_cpu.to("spyre")
-        b_dev = b_cpu.to("spyre")
-        _pnd.name_tensor_dims(a_dev, ["M", "K"])
-        _pnd.name_tensor_dims(b_dev, ["K", "N"])
-        inputs_dev.append((a_dev, b_dev))
+        compiled = torch.compile(k_tiled_mm, backend="inductor")
 
-    # Warm up: two passes outside the profiled window.
-    for a_dev, b_dev in inputs_dev:
-        compiled(a_dev, b_dev)
-    _sync_all(device)
-    for a_dev, b_dev in inputs_dev:
-        compiled(a_dev, b_dev)
-    _sync_all(device)
+        inputs_dev = []
+        for a_cpu, b_cpu in inputs_cpu:
+            a_dev = a_cpu.to("spyre")
+            b_dev = b_cpu.to("spyre")
+            _pnd.name_tensor_dims(a_dev, ["M", "K"])
+            _pnd.name_tensor_dims(b_dev, ["K", "N"])
+            inputs_dev.append((a_dev, b_dev))
 
-    # Profiled window.
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
-    ) as prof:
-        results = []
+        # Warm up: two passes outside the profiled window.
         for a_dev, b_dev in inputs_dev:
-            results.append(compiled(a_dev, b_dev))
+            compiled(a_dev, b_dev)
+        _sync_all(device)
+        for a_dev, b_dev in inputs_dev:
+            compiled(a_dev, b_dev)
         _sync_all(device)
 
-    trace_path = os.environ[_ENV_TRACE]
-    prof.export_chrome_trace(trace_path)
+        # Profiled window.
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+        ) as prof:
+            results = []
+            for a_dev, b_dev in inputs_dev:
+                results.append(compiled(a_dev, b_dev))
+            _sync_all(device)
 
-    torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
+        trace_path = os.environ[_ENV_TRACE]
+        prof.export_chrome_trace(trace_path)
+
+        torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
+    finally:
+        _cleanup_device(device)
 
 
 # ── subprocess launcher ───────────────────────────────────────────────────────
@@ -209,6 +221,7 @@ def _run_trace_child(
     tracker: int,
     result_path: str,
     trace_path: str,
+    max_retries: int = 3,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env[_ENV_TRACKER] = str(tracker)
@@ -220,27 +233,37 @@ def _run_trace_child(
     env["FLEX_SKIP_TIMESTAMP_CALIBRATION"] = "0"  # legacy alias (flex < #1930)
     env["SPYRE_NUM_CPUS"] = "1"
 
-    proc = subprocess.run(
-        [
-            sys.executable,
-            __file__,
-            "trace_workload",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        cwd=os.path.dirname(__file__),
-        timeout=300,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise AssertionError(
-            f"Trace child (SPYRE_HAZARD_TRACKER={tracker}) exited "
-            f"{proc.returncode}\n"
-            f"--- stdout ---\n{proc.stdout}\n"
-            f"--- stderr ---\n{proc.stderr}"
+    proc = None
+    for attempt in range(max_retries):
+        time.sleep(0.5)  # Allow previous process to release VFIO device
+        proc = subprocess.run(
+            [
+                sys.executable,
+                __file__,
+                "trace_workload",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__),
+            timeout=300,
+            check=False,
         )
-    return proc
+        if proc.returncode == 0:
+            return proc
+        # Retry on device busy / VFIO cleanup delay
+        if "Device or resource busy" in proc.stderr or "DeviceOpenFail" in proc.stderr:
+            time.sleep(1.0 * (attempt + 1))
+            continue
+        break
+
+    assert proc is not None
+    raise AssertionError(
+        f"Trace child (SPYRE_HAZARD_TRACKER={tracker}) exited "
+        f"{proc.returncode}\n"
+        f"--- stdout ---\n{proc.stdout}\n"
+        f"--- stderr ---\n{proc.stderr}"
+    )
 
 
 # ── orchestrator tests ────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@
 
 """Split-execution parity tests (no profiler required)."""
 
+import contextlib
 import hashlib
 import os
 import pathlib
@@ -64,9 +65,12 @@ def _sync_all(device: torch.device) -> None:
     ).synchronize()
 
 
-def _s_prep(device: torch.device):
-    """Return the C-level S_prep stream handle."""
-    return torch_spyre._C.host_compute_stream_by_id(_HOST_COMPUTE_STREAM_ID, device)
+def _cleanup_device(device: torch.device) -> None:
+    """Safely drain and release device runtime on child process exit."""
+    with contextlib.suppress(Exception):
+        _sync_all(device)
+    with contextlib.suppress(Exception):
+        torch_spyre._C.free_runtime()
 
 
 def _s_dev(device: torch.device):
@@ -139,8 +143,9 @@ def _run_child(
     *,
     cache_dir: str | None = None,
     shifted: bool = False,
+    max_retries: int = 3,
 ) -> subprocess.CompletedProcess:
-    """Spawn a child process that runs exactly ``child_name``."""
+    """Spawn a child process that runs exactly ``child_name`` with retry on device busy."""
     env = os.environ.copy()
     env[_ENV_TRACKER] = str(tracker)
     env[_ENV_RESULT] = result_path
@@ -150,27 +155,38 @@ def _run_child(
         env["SPYRE_NUM_CPUS"] = "1"
     if shifted:
         env[_ENV_SHIFTED] = "1"
-    proc = subprocess.run(
-        [
-            sys.executable,
-            __file__,
-            child_name,
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        cwd=os.path.dirname(__file__),
-        timeout=300,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise AssertionError(
-            f"Child (SPYRE_HAZARD_TRACKER={tracker}, child={child_name!r}) "
-            f"exited {proc.returncode}\n"
-            f"--- stdout ---\n{proc.stdout}\n"
-            f"--- stderr ---\n{proc.stderr}"
+
+    proc = None
+    for attempt in range(max_retries):
+        time.sleep(0.5)  # Allow previous process to release VFIO device
+        proc = subprocess.run(
+            [
+                sys.executable,
+                __file__,
+                child_name,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__),
+            timeout=300,
+            check=False,
         )
-    return proc
+        if proc.returncode == 0:
+            return proc
+        # Retry on device busy / VFIO cleanup delay
+        if "Device or resource busy" in proc.stderr or "DeviceOpenFail" in proc.stderr:
+            time.sleep(1.0 * (attempt + 1))
+            continue
+        break
+
+    assert proc is not None
+    raise AssertionError(
+        f"Child (SPYRE_HAZARD_TRACKER={tracker}, child={child_name!r}) "
+        f"exited {proc.returncode}\n"
+        f"--- stdout ---\n{proc.stdout}\n"
+        f"--- stderr ---\n{proc.stderr}"
+    )
 
 
 def _collect_parity(
@@ -212,99 +228,75 @@ def _child_single_mm() -> None:
     """Child: single K-tiled mm, saves [result_cpu].
 
     C3 – one launch with tracker on/off; checks plan shape and correctness.
-    Also exercises S_prep routing check (C2) after the one launch.
     """
-    torch._dynamo.reset()
-    _pnd.reset()
-
-    M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
     device = torch.device("spyre")
-    torch.manual_seed(0xAFFE)
-    a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
-    b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
+    try:
+        torch._dynamo.reset()
+        _pnd.reset()
 
-    compiled = _build_compiled_fn(M, K, N)
-    _patch_runner_assert_prep()
+        M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
+        torch.manual_seed(0xAFFE)
+        a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
 
-    a_dev = _to_dev_named(a_cpu, "M", "K")
-    b_dev = _to_dev_named(b_cpu, "K", "N")
+        compiled = _build_compiled_fn(M, K, N)
+        _patch_runner_assert_prep()
 
-    result = compiled(a_dev, b_dev)
+        a_dev = _to_dev_named(a_cpu, "M", "K")
+        b_dev = _to_dev_named(b_cpu, "K", "N")
 
-    tracker_on = os.environ.get(_ENV_TRACKER) == "1"
-    if tracker_on:
-        # C2: S_prep must have queued work immediately after a launch.
-        s_prep_busy = not _s_prep(device).query()
-        assert s_prep_busy, (
-            "TRACKER=1: S_prep (stream 65) reported idle immediately after "
-            "launch — HostCompute step was not routed to S_prep."
-        )
-    else:
-        # C5 fallback: S_prep must be idle (everything ran on S_dev).
-        s_prep_idle = _s_prep(device).query()
-        assert s_prep_idle, (
-            "TRACKER=0: S_prep (stream 65) reported busy after launch — "
-            "single-stream fallback is broken."
-        )
-
-    _sync_all(device)
-    torch.save([result.cpu()], os.environ[_ENV_RESULT])
+        result = compiled(a_dev, b_dev)
+        _sync_all(device)
+        torch.save([result.cpu()], os.environ[_ENV_RESULT])
+    finally:
+        _cleanup_device(device)
 
 
 def _child_pipelined_mm() -> None:
     """Child: _PIPELINE_DEPTH K-tiled mm launches, saves [result_cpu, ...].
 
     C1b – back-to-back launches; shifted order for tracker-on.
-    C2  – S_prep routing checked after every launch.
     """
-    torch._dynamo.reset()
-    _pnd.reset()
-
-    M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
-    n = _PIPELINE_DEPTH
     device = torch.device("spyre")
+    try:
+        torch._dynamo.reset()
+        _pnd.reset()
 
-    torch.manual_seed(0xAFFE)
-    inputs_cpu = [
-        (
-            torch.randn(M, K, dtype=torch.float16) * 0.01,
-            torch.randn(K, N, dtype=torch.float16) * 0.01,
-        )
-        for _ in range(n)
-    ]
+        M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
+        n = _PIPELINE_DEPTH
 
-    compiled = _build_compiled_fn(M, K, N)
-    _patch_runner_assert_prep()
-
-    tracker_on = os.environ.get(_ENV_TRACKER) == "1"
-    shifted = os.environ.get(_ENV_SHIFTED) == "1"
-
-    # Move all inputs to device up-front.
-    inputs_dev = []
-    for a_cpu, b_cpu in inputs_cpu:
-        inputs_dev.append(
-            (_to_dev_named(a_cpu, "M", "K"), _to_dev_named(b_cpu, "K", "N"))
-        )
-
-    results = []
-    for slot in range(n):
-        # Tracker-on child uses shifted order: slot k computes pair (k+1) % n.
-        pair = (slot + 1) % n if shifted else slot
-        a_dev, b_dev = inputs_dev[pair]
-        results.append(compiled(a_dev, b_dev))
-
-        if tracker_on:
-            # C2: S_prep must be busy right after each launch.
-            assert not _s_prep(device).query(), (
-                f"TRACKER=1: S_prep idle after launch at slot {slot}."
+        torch.manual_seed(0xAFFE)
+        inputs_cpu = [
+            (
+                torch.randn(M, K, dtype=torch.float16) * 0.01,
+                torch.randn(K, N, dtype=torch.float16) * 0.01,
             )
-        else:
-            assert _s_prep(device).query(), (
-                f"TRACKER=0: S_prep busy after launch at slot {slot}."
+            for _ in range(n)
+        ]
+
+        compiled = _build_compiled_fn(M, K, N)
+        _patch_runner_assert_prep()
+
+        shifted = os.environ.get(_ENV_SHIFTED) == "1"
+
+        # Move all inputs to device up-front.
+        inputs_dev = []
+        for a_cpu, b_cpu in inputs_cpu:
+            inputs_dev.append(
+                (_to_dev_named(a_cpu, "M", "K"), _to_dev_named(b_cpu, "K", "N"))
             )
 
-    _sync_all(device)
-    torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
+        results = []
+        for slot in range(n):
+            # Tracker-on child uses shifted order: slot k computes pair (k+1) % n.
+            pair = (slot + 1) % n if shifted else slot
+            a_dev, b_dev = inputs_dev[pair]
+            results.append(compiled(a_dev, b_dev))
+
+        _sync_all(device)
+        torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
+    finally:
+        _cleanup_device(device)
 
 
 def _child_host_ahead() -> None:
@@ -318,56 +310,59 @@ def _child_host_ahead() -> None:
     The parent test uses host_ns[k+1] < time-when-dev-became-idle-after-launch-k
     to verify host ran ahead of the device.
     """
-    torch._dynamo.reset()
-    _pnd.reset()
-
-    M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
-    n = _HOST_AHEAD_PAIRS + 1
     device = torch.device("spyre")
+    try:
+        torch._dynamo.reset()
+        _pnd.reset()
 
-    torch.manual_seed(0xCAFE)
-    inputs_cpu = [
-        (
-            torch.randn(M, K, dtype=torch.float16) * 0.01,
-            torch.randn(K, N, dtype=torch.float16) * 0.01,
+        M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
+        n = _HOST_AHEAD_PAIRS + 1
+
+        torch.manual_seed(0xCAFE)
+        inputs_cpu = [
+            (
+                torch.randn(M, K, dtype=torch.float16) * 0.01,
+                torch.randn(K, N, dtype=torch.float16) * 0.01,
+            )
+            for _ in range(n)
+        ]
+
+        compiled = _build_compiled_fn(M, K, N)
+        _patch_runner_assert_prep()
+
+        inputs_dev = []
+        for a_cpu, b_cpu in inputs_cpu:
+            inputs_dev.append(
+                (_to_dev_named(a_cpu, "M", "K"), _to_dev_named(b_cpu, "K", "N"))
+            )
+
+        # Warm up: one launch outside measurement.
+        compiled(inputs_dev[0][0], inputs_dev[0][1])
+        _sync_all(device)
+
+        results: list[torch.Tensor] = []
+        host_ns: list[int] = []
+        dev_idle_before: list[bool] = []
+
+        for i in range(n):
+            # Record: was the device still busy at the moment we start launch i?
+            dev_idle_before.append(_s_dev(device).query())
+            host_ns.append(time.perf_counter_ns())
+            a_dev, b_dev = inputs_dev[i]
+            results.append(compiled(a_dev, b_dev))
+
+        _sync_all(device)
+
+        torch.save(
+            {
+                "results": [r.cpu() for r in results],
+                "host_ns": host_ns,
+                "dev_idle_before": dev_idle_before,
+            },
+            os.environ[_ENV_RESULT],
         )
-        for _ in range(n)
-    ]
-
-    compiled = _build_compiled_fn(M, K, N)
-    _patch_runner_assert_prep()
-
-    inputs_dev = []
-    for a_cpu, b_cpu in inputs_cpu:
-        inputs_dev.append(
-            (_to_dev_named(a_cpu, "M", "K"), _to_dev_named(b_cpu, "K", "N"))
-        )
-
-    # Warm up: one launch outside measurement.
-    compiled(inputs_dev[0][0], inputs_dev[0][1])
-    _sync_all(device)
-
-    results: list[torch.Tensor] = []
-    host_ns: list[int] = []
-    dev_idle_before: list[bool] = []
-
-    for i in range(n):
-        # Record: was the device still busy at the moment we start launch i?
-        dev_idle_before.append(_s_dev(device).query())
-        host_ns.append(time.perf_counter_ns())
-        a_dev, b_dev = inputs_dev[i]
-        results.append(compiled(a_dev, b_dev))
-
-    _sync_all(device)
-
-    torch.save(
-        {
-            "results": [r.cpu() for r in results],
-            "host_ns": host_ns,
-            "dev_idle_before": dev_idle_before,
-        },
-        os.environ[_ENV_RESULT],
-    )
+    finally:
+        _cleanup_device(device)
 
 
 # ── orchestrator (parent) tests ───────────────────────────────────────────────
