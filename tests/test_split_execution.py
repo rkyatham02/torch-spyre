@@ -87,13 +87,28 @@ def shared_compile_cache(tmp_path_factory) -> pathlib.Path:
 
 _MM_M, _MM_K, _MM_N = 1024, 8192, 1024  # device-bound shape (kernel ~800 µs)
 _MM_DTYPE = torch.float16
+_ROUTING_LAUNCHES = 8  # launches per routing child; kernel ~800 µs, host ~50 µs
 
 
 def _child_s_prep_routing(
     tracker_on: bool,
     result_queue: multiprocessing.Queue,
 ) -> None:
-    """Child: one mm launch, return S_prep queued-work flag after launch."""
+    """Child: queue several mm launches, sample S_prep between them.
+
+    Strategy:
+    - Warm-up so the cache is hot.
+    - Snapshot the S_prep stream ID via host_compute_stream() BEFORE the timed
+      launches.  host_compute_stream() is round-robin, so we save the ID and
+      re-fetch the same stream by ID after each launch — otherwise we'd sample
+      a different stream in the pool.
+    - Fire _ROUTING_LAUNCHES launches back-to-back without syncing.  With the
+      device-bound shape (~800 µs kernel), the device is busy for several ms
+      while Python submits the next launch.  If the tracker is on, HostCompute
+      for launch k+1 is routed to S_prep while kernel k is still running, so
+      S_prep should be non-idle at least once across all samples.
+    - Record how many samples observed S_prep busy.
+    """
     import torch
     import torch._dynamo
     from torch_spyre import _C
@@ -104,22 +119,32 @@ def _child_s_prep_routing(
     b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE, device=device)
 
     compiled = torch.compile(torch.mm, backend="inductor")
-    compiled(a, b)  # warm-up / compile
-
-    # snapshot S_prep before launch
-    s_prep_before = _C.host_compute_stream(device)
-    before_done = s_prep_before.query()
-
-    # actual timed launch
+    # warm-up / compile — do not count this launch
     compiled(a, b)
+    torch.accelerator.synchronize(device)
 
-    # query S_prep immediately after returning from launch (no sync yet)
-    s_prep = _C.host_compute_stream(device)
-    has_work = not s_prep.query()  # False → idle, True → work was queued
+    # Snapshot the stream ID that the *next* host_compute_stream() call will
+    # return.  We call it once here to pin the ID, then use by_id for all
+    # subsequent queries so we always look at the same stream.
+    s_prep_id = _C.host_compute_stream(device).id()
+
+    busy_samples = 0
+    for _ in range(_ROUTING_LAUNCHES):
+        compiled(a, b)
+        # Query the same stream by ID immediately — no sync, no yield.
+        s = _C.host_compute_stream_by_id(s_prep_id, device)
+        if not s.query():
+            busy_samples += 1
 
     torch.accelerator.synchronize(device)
     result_queue.put(
-        {"tracker_on": tracker_on, "has_work": has_work, "before_done": before_done}
+        {
+            "tracker_on": tracker_on,
+            # For tracker-on we require at least one busy sample.
+            # For tracker-off we require zero.
+            "busy_samples": busy_samples,
+            "total_launches": _ROUTING_LAUNCHES,
+        }
     )
 
 
@@ -251,13 +276,18 @@ class TestSPrepRouting:
     """C3/C5: with tracker on, S_prep has queued work after a launch; off → idle."""
 
     def test_s_prep_has_queued_work_tracker_on(self, shared_compile_cache):
-        """Tracker on: S_prep is not idle immediately after launch.
+        """Tracker on: S_prep must be busy at least once across _ROUTING_LAUNCHES.
 
         HOW TO TEST:
-          SPYRE_HAZARD_TRACKER=1 pytest tests/test_split_execution.py::TestSPrepRouting::test_s_prep_has_queued_work_tracker_on -v
+          pytest tests/test_split_execution.py::TestSPrepRouting::test_s_prep_has_queued_work_tracker_on -v
 
-        What this proves: the HostCompute step was routed to S_prep, which means
-        the split is actually happening at runtime, not just in the plan.
+        What this proves: HostCompute was routed to S_prep (not S_dev), so the
+        split is actually happening at runtime — not just in the plan.
+
+        We fire _ROUTING_LAUNCHES back-to-back without syncing, sampling S_prep
+        by a fixed stream ID after each one.  With a ~800 µs kernel and ~50 µs
+        host computation, the device is busy for ~6 s total while Python submits
+        launches, so S_prep should be non-idle on many samples.
         """
         result = _run_in_child(
             _child_s_prep_routing,
@@ -265,17 +295,22 @@ class TestSPrepRouting:
             env_overrides=_tracker_on_env(),
             cache_dir=shared_compile_cache,
         )
-        assert result["has_work"], (
-            "SPYRE_HAZARD_TRACKER=1: S_prep should have queued work immediately "
-            "after launch (HostCompute was routed there), but query() returned True "
-            "(idle). The split is not happening."
+        busy = result["busy_samples"]
+        total = result["total_launches"]
+        assert busy > 0, (
+            f"SPYRE_HAZARD_TRACKER=1: S_prep was idle on all {total} samples "
+            "immediately after each launch. HostCompute is not being routed to "
+            "S_prep — the split is not happening."
         )
 
     def test_s_prep_has_no_queued_work_tracker_off(self, shared_compile_cache):
-        """Tracker off (C5 fallback): S_prep is idle — everything ran on S_dev.
+        """Tracker off (C5 fallback): S_prep must be idle on every sample.
 
         HOW TO TEST:
-          SPYRE_HAZARD_TRACKER=0 pytest tests/test_split_execution.py::TestSPrepRouting::test_s_prep_has_no_queued_work_tracker_off -v
+          pytest tests/test_split_execution.py::TestSPrepRouting::test_s_prep_has_no_queued_work_tracker_off -v
+
+        With the tracker off every step runs on S_dev, so S_prep is never
+        touched and must report idle after every launch.
         """
         result = _run_in_child(
             _child_s_prep_routing,
@@ -283,10 +318,12 @@ class TestSPrepRouting:
             env_overrides=_tracker_off_env(),
             cache_dir=shared_compile_cache,
         )
-        assert not result["has_work"], (
-            "SPYRE_HAZARD_TRACKER=0: S_prep should be idle after launch "
-            "(all steps ran on S_dev), but query() returned False (has work). "
-            "The fallback path is broken."
+        busy = result["busy_samples"]
+        total = result["total_launches"]
+        assert busy == 0, (
+            f"SPYRE_HAZARD_TRACKER=0: S_prep was busy on {busy}/{total} samples. "
+            "All steps should run on S_dev with the tracker off — S_prep should "
+            "never have work queued."
         )
 
 
