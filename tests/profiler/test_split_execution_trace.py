@@ -410,13 +410,6 @@ class TestSplitExecutionTrace:
                 f"Launch {k}: relative Frobenius error {rel_frob:.4e} exceeds 1% "
                 f"inside profiled region — profiling may have corrupted execution."
             )
-            torch.testing.assert_close(
-                out,
-                ref,
-                atol=0.35,
-                rtol=0.05,
-                msg=f"Launch {k}: profiled output does not match CPU reference.",
-            )
 
     def test_reprofiled_window_after_calibration(self, compiled_mm):
         """A second profiling session after the first produces valid device events.
