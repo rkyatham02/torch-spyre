@@ -458,12 +458,19 @@ class TestSingleLaunchCorrectness:
         )
         out = torch.tensor(result["out"])
         ref = torch.tensor(result["ref"])
+        abs_diff = (out - ref).abs()
+        max_abs = abs_diff.max().item()
+        max_rel = (abs_diff / (ref.abs() + 1e-7)).max().item()
+        print(
+            f"\n[tracker_on={tracker_on}] max_abs_diff={max_abs:.6f}, max_rel_diff={max_rel:.6f}"
+        )
+        print(f"out[0, :5]={out[0, :5].tolist()}")
+        print(f"ref[0, :5]={ref[0, :5].tolist()}")
         torch.testing.assert_close(
             out,
             ref,
             atol=0.1,
             rtol=0.05,
-            msg=(f"mm output does not match CPU reference (tracker_on={tracker_on})"),
         )
 
 
