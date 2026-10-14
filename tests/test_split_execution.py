@@ -55,13 +55,11 @@ DESIGN
 """
 
 import multiprocessing
-import os
 import pathlib
-from typing import List, Tuple
+import traceback
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Shared compile-cache fixture
@@ -92,10 +90,7 @@ _MM_DTYPE = torch.float16
 _COR_M, _COR_K, _COR_N = 64, 512, 64
 
 
-def _child_s_prep_routing(
-    tracker_on: bool,
-    result_queue: multiprocessing.Queue,
-) -> None:
+def _child_s_prep_routing(tracker_on: bool) -> dict:
     """Child: verify the hazard-tracker flag and the JobPlan routing contract.
 
     What we check (C3/C5):
@@ -175,25 +170,20 @@ def _child_s_prep_routing(
     step_types = [job_plan.get_step_type(i) for i in range(num_steps)]
     step_roles = [job_plan.get_step_stream_role(i) for i in range(num_steps)]
 
-    result_queue.put(
-        {
-            "tracker_on": tracker_on,
-            "tracker_enabled": tracker_enabled,
-            "step_types": step_types,
-            "step_roles": step_roles,
-        }
-    )
+    return {
+        "tracker_on": tracker_on,
+        "tracker_enabled": tracker_enabled,
+        "step_types": step_types,
+        "step_roles": step_roles,
+    }
 
 
-def _child_single_launch_correctness(
-    tracker_on: bool,
-    result_queue: multiprocessing.Queue,
-) -> None:
+def _child_single_launch_correctness(tracker_on: bool) -> dict:
     """Child: compile + run mm once, return results as plain lists (not tensors).
 
-    Tensors cannot safely cross the queue after the child exits — torch uses a
+    Tensors cannot safely cross the process boundary after the child exits — torch uses a
     shared-memory socket that is torn down on exit.  We convert to Python lists
-    before queueing so the parent receives plain serialisable data.
+    before returning so the parent receives plain serialisable data.
     """
     import torch
     import torch._dynamo
@@ -213,22 +203,19 @@ def _child_single_launch_correctness(
 
     torch.accelerator.synchronize()
     # Serialize as nested lists — safe across process boundary after child exits.
-    result_queue.put(
-        {
-            "out": out.float().tolist(),
-            "ref": ref.float().tolist(),
-            "tracker_on": tracker_on,
-            "shape": list(out.shape),
-        }
-    )
+    return {
+        "out": out.float().tolist(),
+        "ref": ref.float().tolist(),
+        "tracker_on": tracker_on,
+        "shape": list(out.shape),
+    }
 
 
 def _child_back_to_back(
     tracker_on: bool,
     num_launches: int,
     shift: int,
-    result_queue: multiprocessing.Queue,
-) -> None:
+) -> dict:
     """Child: run mm num_launches times, return outputs as lists (not tensors).
 
     Uses the smaller correctness shape so the compile fits in the timeout.
@@ -244,7 +231,7 @@ def _child_back_to_back(
     device = torch.device("spyre")
 
     # Use the smaller correctness shape.
-    pairs_cpu: List[Tuple[torch.Tensor, torch.Tensor]] = [
+    pairs_cpu: list[tuple[torch.Tensor, torch.Tensor]] = [
         (
             torch.randn(_COR_M, _COR_K, dtype=_MM_DTYPE),
             torch.randn(_COR_K, _COR_N, dtype=_MM_DTYPE),
@@ -257,8 +244,8 @@ def _child_back_to_back(
     # warm-up with pair 0
     compiled(pairs_spyre[0][0], pairs_spyre[0][1])
 
-    outputs: List[List] = []
-    refs: List[List] = []
+    outputs: list[list] = []
+    refs: list[list] = []
     for k in range(num_launches):
         idx = (k + shift) % num_launches
         a_s, b_s = pairs_spyre[idx]
@@ -270,27 +257,33 @@ def _child_back_to_back(
 
     torch.accelerator.synchronize(device)
 
-    result_queue.put(
-        {
-            "tracker_on": tracker_on,
-            "outputs": outputs,
-            "refs": refs,
-        }
-    )
+    return {
+        "tracker_on": tracker_on,
+        "outputs": outputs,
+        "refs": refs,
+    }
 
 
 def _child_wrapper(
     env_overrides: dict,
     target,
     args: tuple,
-    result_queue: multiprocessing.Queue,
+    conn,
 ) -> None:
     """Apply env overrides BEFORE any import, then call target."""
-    # Must happen before torch_spyre is imported: startRuntime() reads env vars
-    # once via std::call_once, so they must be set before the first device op.
-    for k, v in env_overrides.items():
-        os.environ[k] = v
-    target(*args, result_queue)
+    import os
+
+    try:
+        # Must happen before torch_spyre is imported: startRuntime() reads env vars
+        # once via std::call_once, so they must be set before the first device op.
+        for k, v in env_overrides.items():
+            os.environ[k] = v
+        result = target(*args)
+        conn.send((True, result))
+    except Exception as e:  # noqa: BLE001
+        conn.send((False, f"{e}\n{traceback.format_exc()}"))
+    finally:
+        conn.close()
 
 
 def _run_in_child(
@@ -311,17 +304,40 @@ def _run_in_child(
     all_overrides.update(env_overrides)
 
     ctx = multiprocessing.get_context("spawn")
-    q: multiprocessing.Queue = ctx.Queue()
-    p = ctx.Process(target=_child_wrapper, args=(all_overrides, target, args, q))
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(
+        target=_child_wrapper, args=(all_overrides, target, args, child_conn)
+    )
     p.start()
-    p.join(timeout=timeout)
+    child_conn.close()
+
+    success: bool | None = None
+    payload: dict | None = None
+    if parent_conn.poll(timeout):
+        try:
+            success, payload = parent_conn.recv()
+        except EOFError:
+            pass
+
+    p.join(timeout=5.0)
     if p.is_alive():
         p.terminate()
         p.join()
         raise TimeoutError(f"Child process timed out after {timeout}s")
-    if p.exitcode != 0:
+
+    parent_conn.close()
+
+    if p.exitcode != 0 and success is None:
         raise RuntimeError(f"Child process exited with code {p.exitcode}")
-    return q.get_nowait()
+
+    if success is False:
+        raise RuntimeError(f"Child process failed:\n{payload}")
+    if success is None or payload is None:
+        raise RuntimeError(
+            f"Child process exited without returning a result (exitcode={p.exitcode})"
+        )
+
+    return payload
 
 
 def _tracker_on_env() -> dict:
