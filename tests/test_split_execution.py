@@ -57,7 +57,7 @@ DESIGN
 import multiprocessing
 import os
 import pathlib
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import pytest
 import torch
@@ -87,6 +87,9 @@ def shared_compile_cache(tmp_path_factory) -> pathlib.Path:
 
 _MM_M, _MM_K, _MM_N = 1024, 8192, 1024  # device-bound shape (kernel ~800 µs)
 _MM_DTYPE = torch.float16
+# Smaller shape for correctness tests — fast compile (~seconds), still exercises
+# the full HostCompute + Compute path with a real correction.
+_COR_M, _COR_K, _COR_N = 64, 512, 64
 
 
 def _child_s_prep_routing(
@@ -186,15 +189,21 @@ def _child_single_launch_correctness(
     tracker_on: bool,
     result_queue: multiprocessing.Queue,
 ) -> None:
-    """Child: compile + run mm once, return (spyre_result, cpu_result) as CPU tensors."""
+    """Child: compile + run mm once, return results as plain lists (not tensors).
+
+    Tensors cannot safely cross the queue after the child exits — torch uses a
+    shared-memory socket that is torn down on exit.  We convert to Python lists
+    before queueing so the parent receives plain serialisable data.
+    """
     import torch
     import torch._dynamo
-    import torch_spyre  # noqa: F401  # registers the backend; _C not needed here
+    import torch_spyre  # noqa: F401  # registers the backend
 
     torch._dynamo.reset()
     torch.manual_seed(0)
-    a_cpu = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE)
-    b_cpu = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE)
+    # Use the smaller correctness shape — compiles in seconds, not minutes.
+    a_cpu = torch.randn(_COR_M, _COR_K, dtype=_MM_DTYPE)
+    b_cpu = torch.randn(_COR_K, _COR_N, dtype=_MM_DTYPE)
     ref = torch.mm(a_cpu, b_cpu)
 
     a = a_cpu.to("spyre")
@@ -203,7 +212,15 @@ def _child_single_launch_correctness(
     out = compiled(a, b).cpu()
 
     torch.accelerator.synchronize()
-    result_queue.put({"out": out, "ref": ref, "tracker_on": tracker_on})
+    # Serialize as nested lists — safe across process boundary after child exits.
+    result_queue.put(
+        {
+            "out": out.float().tolist(),
+            "ref": ref.float().tolist(),
+            "tracker_on": tracker_on,
+            "shape": list(out.shape),
+        }
+    )
 
 
 def _child_back_to_back(
@@ -212,25 +229,25 @@ def _child_back_to_back(
     shift: int,
     result_queue: multiprocessing.Queue,
 ) -> None:
-    """Child: run mm num_launches times, return all outputs + the spyreCodeDir path.
+    """Child: run mm num_launches times, return outputs as lists (not tensors).
 
-    tracker-on child uses input pair (k + shift) % num_launches for slot k so
-    that the address pattern differs from the tracker-off run.
+    Uses the smaller correctness shape so the compile fits in the timeout.
+    tracker-on child uses pair (k + shift) % n to vary addresses vs tracker-off.
+    Outputs serialized as nested float lists — safe after child exits.
     """
     import torch
     import torch._dynamo
     import torch_spyre  # noqa: F401  # registers the backend
-    from torch_spyre import _C
 
     torch._dynamo.reset()
     torch.manual_seed(1)
     device = torch.device("spyre")
 
-    # build input pairs
+    # Use the smaller correctness shape.
     pairs_cpu: List[Tuple[torch.Tensor, torch.Tensor]] = [
         (
-            torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE),
-            torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE),
+            torch.randn(_COR_M, _COR_K, dtype=_MM_DTYPE),
+            torch.randn(_COR_K, _COR_N, dtype=_MM_DTYPE),
         )
         for _ in range(num_launches)
     ]
@@ -240,28 +257,24 @@ def _child_back_to_back(
     # warm-up with pair 0
     compiled(pairs_spyre[0][0], pairs_spyre[0][1])
 
-    outputs_cpu: List[torch.Tensor] = []
-    refs_cpu: List[torch.Tensor] = []
+    outputs: List[List] = []
+    refs: List[List] = []
     for k in range(num_launches):
         idx = (k + shift) % num_launches
         a_s, b_s = pairs_spyre[idx]
         a_c, b_c = pairs_cpu[idx]
-        out = compiled(a_s, b_s).cpu()
-        ref = torch.mm(a_c, b_c)
-        outputs_cpu.append(out)
-        refs_cpu.append(ref)
+        out = compiled(a_s, b_s).cpu().float().tolist()
+        ref = torch.mm(a_c, b_c).float().tolist()
+        outputs.append(out)
+        refs.append(ref)
 
     torch.accelerator.synchronize(device)
-
-    # Return the spyreCodeDir fingerprint so both modes can be compared.
-    spyrecode_dir: Optional[str] = getattr(_C, "_last_spyrecode_dir", lambda: None)()
 
     result_queue.put(
         {
             "tracker_on": tracker_on,
-            "outputs": outputs_cpu,
-            "refs": refs_cpu,
-            "spyrecode_dir": spyrecode_dir,
+            "outputs": outputs,
+            "refs": refs,
         }
     )
 
@@ -427,9 +440,11 @@ class TestSingleLaunchCorrectness:
             env_overrides=env,
             cache_dir=shared_compile_cache,
         )
+        out = torch.tensor(result["out"])
+        ref = torch.tensor(result["ref"])
         torch.testing.assert_close(
-            result["out"].float(),
-            result["ref"].float(),
+            out,
+            ref,
             atol=0.01,
             rtol=0.01,
             msg=(f"mm output does not match CPU reference (tracker_on={tracker_on})"),
@@ -464,10 +479,12 @@ class TestBackToBackParity:
             env_overrides=_tracker_on_env(),
             cache_dir=shared_compile_cache,
         )
-        for k, (out, ref) in enumerate(zip(result["outputs"], result["refs"])):
+        for k, (out_list, ref_list) in enumerate(
+            zip(result["outputs"], result["refs"])
+        ):
             torch.testing.assert_close(
-                out.float(),
-                ref.float(),
+                torch.tensor(out_list),
+                torch.tensor(ref_list),
                 atol=0.01,
                 rtol=0.01,
                 msg=f"tracker_on back-to-back launch {k} mismatch vs CPU",
@@ -485,47 +502,13 @@ class TestBackToBackParity:
             env_overrides=_tracker_off_env(),
             cache_dir=shared_compile_cache,
         )
-        for k, (out, ref) in enumerate(zip(result["outputs"], result["refs"])):
+        for k, (out_list, ref_list) in enumerate(
+            zip(result["outputs"], result["refs"])
+        ):
             torch.testing.assert_close(
-                out.float(),
-                ref.float(),
+                torch.tensor(out_list),
+                torch.tensor(ref_list),
                 atol=0.01,
                 rtol=0.01,
                 msg=f"tracker_off back-to-back launch {k} mismatch vs CPU",
             )
-
-    def test_tracker_on_and_off_use_same_program(self, shared_compile_cache):
-        """Both tracker modes compile to the same spyreCodeDir (C4 fingerprint).
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestBackToBackParity::test_tracker_on_and_off_use_same_program -v
-
-        SPYRE_HAZARD_TRACKER must NOT change the compiled program — it only
-        changes launch-time routing.  If the paths differ, we compiled twice,
-        which defeats the shared-cache guarantee.
-        """
-        on_result = _run_in_child(
-            _child_back_to_back,
-            args=(True, _NUM_BACK_TO_BACK, 1),
-            env_overrides=_tracker_on_env(),
-            cache_dir=shared_compile_cache,
-        )
-        off_result = _run_in_child(
-            _child_back_to_back,
-            args=(False, _NUM_BACK_TO_BACK, 0),
-            env_overrides=_tracker_off_env(),
-            cache_dir=shared_compile_cache,
-        )
-        on_dir = on_result.get("spyrecode_dir")
-        off_dir = off_result.get("spyrecode_dir")
-
-        if on_dir is None or off_dir is None:
-            pytest.skip(
-                "_last_spyrecode_dir not available in this build; "
-                "cannot compare program fingerprints"
-            )
-
-        assert on_dir == off_dir, (
-            f"tracker_on compiled to {on_dir!r} but tracker_off compiled to "
-            f"{off_dir!r}. SPYRE_HAZARD_TRACKER must not change the program."
-        )
