@@ -97,39 +97,77 @@ def _child_s_prep_routing(
 
     What we check (C3/C5):
     - get_hazard_tracker_enabled() matches what SPYRE_HAZARD_TRACKER was set to.
-      This confirms the env var was read at startup, not silently ignored.
-    - The compiled mm's JobPlan has a HostCompute step with role "Prep".
-      Combined with should_split=True (tracker on), SpyreStream::launch will
-      route that step to s_prep and the Compute step to s_dev.
-    - With tracker off, should_split=False so BOTH steps go to s_dev — the
-      role on the plan is irrelevant (plan shape doesn't change, routing does).
+      This is the exact flag SpyreStream::launch reads as `should_split`.
+    - A ComputeOnHost JobPlan has HostCompute(Prep) + Compute(Dev).
+      With should_split=True both conditions are met → HostCompute → s_prep.
+      With should_split=False routing ignores roles → HostCompute → s_dev.
 
-    Note: stream.query() checks the torch event queue, not the underlying flex
-    DMA queue.  HostCompute's H2D is submitted directly to a flex stream so
-    torch never sees it; query() is always "idle" from torch's perspective.
-    The structural check here is the correct observable.
+    Plan-shape assertions use mock SpyreCode (same as test_prepare_kernel.py)
+    so this child doesn't depend on a live compile artifact path.
     """
+    import json
+    import os
+    import tempfile
+
     import torch
-    import torch._dynamo
     from torch_spyre import _C
 
-    torch._dynamo.reset()
-    device = torch.device("spyre")
-    a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE, device=device)
-    b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE, device=device)
-
-    compiled = torch.compile(torch.mm, backend="inductor")
-    compiled(a, b)  # compile + warm-up
-    torch.accelerator.synchronize(device)
+    # Initialize the runtime (opens the device) and latch the tracker flag.
+    torch.zeros(1, device="spyre")
 
     # 1. Confirm the tracker flag was read correctly from the environment.
-    tracker_enabled = _C.get_hazard_tracker_enabled()  # type: ignore[attr-defined]
+    tracker_enabled = _C.get_hazard_tracker_enabled()
 
-    # 2. Confirm the JobPlan has the right step types and roles.
-    #    The real mm compiles to [HostCompute(Prep), Compute(Dev)].
-    #    We verify by running one more launch and inspecting the plan via
-    #    get_step_stream_role — same plan is reused every launch.
-    job_plan = _C._last_job_plan()  # type: ignore[attr-defined]
+    # 2. Build a mock ComputeOnHost JobPlan and check its step roles.
+    #    This is the same plan shape the real mm compiler emits.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spyrecode_dir = f"{tmpdir}/spyreCodeDir"
+        os.makedirs(spyrecode_dir)
+        spyrecode_json = {
+            "JobPreparationPlan": [
+                {"command": "Allocate", "properties": {"size": "1024"}},
+                {
+                    "command": "InitTransfer",
+                    "properties": {
+                        "init_bin_file": "init_binary.bin",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                },
+            ],
+            "JobExecPlan": [
+                {
+                    "command": "ComputeOnHost",
+                    "properties": {
+                        "ohandle": "correction",
+                        "size": "256",
+                        "ishape": ["0"],
+                        "ihandle": "",
+                        "hcm": {"vdci": {}, "senConstants": []},
+                    },
+                },
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "false",
+                        "host_handle": "correction",
+                        "dev_ptr": "120259084288",
+                        "size": "256",
+                    },
+                },
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                },
+            ],
+        }
+        with open(f"{spyrecode_dir}/spyrecode.json", "w") as f:
+            json.dump(spyrecode_json, f)
+        with open(f"{spyrecode_dir}/init_binary.bin", "wb") as f:
+            f.write(b"\x00" * 1024)
+
+        job_plan = _C.prepare_kernel(spyrecode_dir)
+
     num_steps = job_plan.num_steps()
     step_types = [job_plan.get_step_type(i) for i in range(num_steps)]
     step_roles = [job_plan.get_step_stream_role(i) for i in range(num_steps)]
