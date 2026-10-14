@@ -160,11 +160,11 @@ def _child_trace_workload() -> None:
 
         M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
 
-        torch.manual_seed(0xAFFE)
+        g = torch.Generator(device="cpu").manual_seed(0xAFFE)
         inputs_cpu = [
             (
-                torch.randn(M, K, dtype=torch.float16) * 0.01,
-                torch.randn(K, N, dtype=torch.float16) * 0.01,
+                torch.randn(M, K, dtype=torch.float16, generator=g) * 0.01,
+                torch.randn(K, N, dtype=torch.float16, generator=g) * 0.01,
             )
             for _ in range(_N_LAUNCHES)
         ]
@@ -518,10 +518,10 @@ class TestSplitExecutionTrace:
         """
         _, results = self._load_trace(tmp_path, tracker=1)
 
-        torch.manual_seed(0xAFFE)
+        g = torch.Generator(device="cpu").manual_seed(0xAFFE)
         M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
-        a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
-        b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_cpu = torch.randn(M, K, dtype=torch.float16, generator=g) * 0.01
+        b_cpu = torch.randn(K, N, dtype=torch.float16, generator=g) * 0.01
         ref = torch.mm(a_cpu.float(), b_cpu.float())
 
         for i, r in enumerate(results):

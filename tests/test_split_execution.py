@@ -235,9 +235,9 @@ def _child_single_mm() -> None:
         _pnd.reset()
 
         M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
-        torch.manual_seed(0xAFFE)
-        a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
-        b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
+        g = torch.Generator(device="cpu").manual_seed(0xAFFE)
+        a_cpu = torch.randn(M, K, dtype=torch.float16, generator=g) * 0.01
+        b_cpu = torch.randn(K, N, dtype=torch.float16, generator=g) * 0.01
 
         compiled = _build_compiled_fn(M, K, N)
         _patch_runner_assert_prep()
@@ -265,11 +265,11 @@ def _child_pipelined_mm() -> None:
         M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
         n = _PIPELINE_DEPTH
 
-        torch.manual_seed(0xAFFE)
+        g = torch.Generator(device="cpu").manual_seed(0xAFFE)
         inputs_cpu = [
             (
-                torch.randn(M, K, dtype=torch.float16) * 0.01,
-                torch.randn(K, N, dtype=torch.float16) * 0.01,
+                torch.randn(M, K, dtype=torch.float16, generator=g) * 0.01,
+                torch.randn(K, N, dtype=torch.float16, generator=g) * 0.01,
             )
             for _ in range(n)
         ]
@@ -318,11 +318,11 @@ def _child_host_ahead() -> None:
         M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
         n = _HOST_AHEAD_PAIRS + 1
 
-        torch.manual_seed(0xCAFE)
+        g = torch.Generator(device="cpu").manual_seed(0xCAFE)
         inputs_cpu = [
             (
-                torch.randn(M, K, dtype=torch.float16) * 0.01,
-                torch.randn(K, N, dtype=torch.float16) * 0.01,
+                torch.randn(M, K, dtype=torch.float16, generator=g) * 0.01,
+                torch.randn(K, N, dtype=torch.float16, generator=g) * 0.01,
             )
             for _ in range(n)
         ]
@@ -399,10 +399,10 @@ class TestSingleLaunchParity:
         atol=0.1 would pass an all-zero output, so we use relative Frobenius
         norm ≤ 5e-3 (measured: 2.5e-3–3.7e-3 on this shape).
         """
-        torch.manual_seed(0xAFFE)
+        g = torch.Generator(device="cpu").manual_seed(0xAFFE)
         M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
-        a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
-        b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_cpu = torch.randn(M, K, dtype=torch.float16, generator=g) * 0.01
+        b_cpu = torch.randn(K, N, dtype=torch.float16, generator=g) * 0.01
         ref = torch.mm(a_cpu.float(), b_cpu.float())
 
         cache_dir = str(tmp_path / "cache")
