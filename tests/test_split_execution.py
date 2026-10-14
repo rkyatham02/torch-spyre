@@ -19,16 +19,13 @@ the regression + integration + trunk CI suites.
 
 HOW TO RUN JUST ONE SECTION AT A TIME
 --------------------------------------
-  # Section 1 — plan shape (no device needed):
-  pytest tests/test_split_execution.py::TestPlanShape -v
-
-  # Section 2 — S_prep routing (device required):
+  # Section 1 — S_prep routing (device required):
   pytest tests/test_split_execution.py::TestSPrepRouting -v
 
-  # Section 3 — single-launch correctness (device required):
+  # Section 2 — single-launch correctness (device required):
   pytest tests/test_split_execution.py::TestSingleLaunchCorrectness -v
 
-  # Section 4 — back-to-back launches, parity across tracker modes (device required):
+  # Section 3 — back-to-back launches, parity across tracker modes (device required):
   pytest tests/test_split_execution.py::TestBackToBackParity -v
 
   # All sections at once:
@@ -36,7 +33,8 @@ HOW TO RUN JUST ONE SECTION AT A TIME
 
 HOW EACH SECTION RELATES TO THE CRITERIA FROM #2889
 -----------------------------------------------------
-C3 — single-launch routing:   TestPlanShape + TestSPrepRouting
+C3 — plan shape / roles: covered by test_prepare_kernel.py::TestPrepareKernel
+C3 — single-launch routing:   TestSPrepRouting
 C5 — fallback (tracker off):  TestSPrepRouting.test_s_prep_has_no_queued_work_tracker_off
 C1a — host ran ahead of device inside one launch:  TestSingleLaunchCorrectness
 C4 — same program in both modes (identical spyreCodeDir):  TestBackToBackParity
@@ -50,6 +48,10 @@ DESIGN
 * The tracker-on child launches in a shifted order (pair (k+1) % n) so that
   address collisions between runs are detectable.
 * No pytest.skip anywhere in this file.
+* Plan-shape assertions (HostCompute→Prep, Compute→Dev) live in
+  test_prepare_kernel.py::TestPrepareKernel::test_prepare_emits_bare_split_triple
+  and test_split_triple_roles — they call prepare_kernel with mock SpyreCode
+  inside a process that already has the runtime open, which is the right place.
 """
 
 import multiprocessing
@@ -85,27 +87,6 @@ def shared_compile_cache(tmp_path_factory) -> pathlib.Path:
 
 _MM_M, _MM_K, _MM_N = 1024, 8192, 1024  # device-bound shape (kernel ~800 µs)
 _MM_DTYPE = torch.float16
-
-
-def _child_get_plan_shape(result_queue: multiprocessing.Queue) -> None:
-    """Child: compile mm, return (num_steps, step_types, step_roles)."""
-    import torch
-    import torch._dynamo
-    from torch_spyre import _C
-
-    torch._dynamo.reset()
-    a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE, device="spyre")
-    b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE, device="spyre")
-
-    compiled = torch.compile(torch.mm, backend="inductor")
-    compiled(a, b)  # triggers compilation
-
-    # Retrieve the most-recently-prepared JobPlan from the runtime.
-    job_plan = _C._last_job_plan()  # type: ignore[attr-defined]
-    n = job_plan.num_steps()
-    types = [job_plan.get_step_type(i) for i in range(n)]
-    roles = [job_plan.get_step_stream_role(i) for i in range(n)]
-    result_queue.put((n, types, roles))
 
 
 def _child_s_prep_routing(
@@ -262,140 +243,7 @@ def _tracker_off_env() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Section 1 — Plan shape (C3: static plan carries the right types and roles)
-# ---------------------------------------------------------------------------
-# These tests verify the JobPlan that prepare_kernel emits for a compiled mm.
-# They use mock SpyreCode (no real compile) so they run without a full device
-# stack, making them fast and safe to run anywhere.
-
-
-class TestPlanShape:
-    """C3: the compiled mm produces [HostCompute(Prep), Compute(Dev)]."""
-
-    def test_mm_plan_has_host_compute_then_compute(self, tmp_path):
-        """prepare_kernel on the ComputeOnHost mock emits exactly 2 steps.
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestPlanShape::test_mm_plan_has_host_compute_then_compute -v
-        """
-        import json
-        import torch_spyre
-
-        # Minimal ComputeOnHost spyrecode (same shape as the real mm compiler output)
-        spyrecode_dir = tmp_path / "spyreCodeDir"
-        spyrecode_dir.mkdir()
-        spyrecode_json = {
-            "JobPreparationPlan": [
-                {"command": "Allocate", "properties": {"size": "1024"}},
-                {
-                    "command": "InitTransfer",
-                    "properties": {
-                        "init_bin_file": "init_binary.bin",
-                        "dev_ptr": "120259084288",
-                        "size": "1024",
-                    },
-                },
-            ],
-            "JobExecPlan": [
-                {
-                    "command": "ComputeOnHost",
-                    "properties": {
-                        "ohandle": "correction",
-                        "size": "256",
-                        "ishape": ["0"],
-                        "ihandle": "",
-                        "hcm": {"vdci": {}, "senConstants": []},
-                    },
-                },
-                {
-                    "command": "DataTransfer",
-                    "properties": {
-                        "dirn": "false",
-                        "host_handle": "correction",
-                        "dev_ptr": "120259084288",
-                        "size": "256",
-                    },
-                },
-                {
-                    "command": "ComputeOnDevice",
-                    "properties": {"job_bin_ptr": "120259084288"},
-                },
-            ],
-        }
-        (spyrecode_dir / "spyrecode.json").write_text(json.dumps(spyrecode_json))
-        (spyrecode_dir / "init_binary.bin").write_bytes(b"\x00" * 1024)
-
-        job_plan = torch_spyre._C.prepare_kernel(str(spyrecode_dir))
-
-        # The H2D is merged into HostCompute, so exactly 2 steps survive.
-        assert job_plan.num_steps() == 2
-        assert job_plan.get_step_type(0) == "HostCompute"
-        assert job_plan.get_step_type(1) == "Compute"
-
-    def test_mm_plan_roles_are_prep_then_dev(self, tmp_path):
-        """HostCompute → Prep, Compute → Dev (C3 static routing contract).
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestPlanShape::test_mm_plan_roles_are_prep_then_dev -v
-        """
-        import json
-        import torch_spyre
-
-        spyrecode_dir = tmp_path / "spyreCodeDir"
-        spyrecode_dir.mkdir()
-        spyrecode_json = {
-            "JobPreparationPlan": [
-                {"command": "Allocate", "properties": {"size": "1024"}},
-                {
-                    "command": "InitTransfer",
-                    "properties": {
-                        "init_bin_file": "init_binary.bin",
-                        "dev_ptr": "120259084288",
-                        "size": "1024",
-                    },
-                },
-            ],
-            "JobExecPlan": [
-                {
-                    "command": "ComputeOnHost",
-                    "properties": {
-                        "ohandle": "correction",
-                        "size": "256",
-                        "ishape": ["0"],
-                        "ihandle": "",
-                        "hcm": {"vdci": {}, "senConstants": []},
-                    },
-                },
-                {
-                    "command": "DataTransfer",
-                    "properties": {
-                        "dirn": "false",
-                        "host_handle": "correction",
-                        "dev_ptr": "120259084288",
-                        "size": "256",
-                    },
-                },
-                {
-                    "command": "ComputeOnDevice",
-                    "properties": {"job_bin_ptr": "120259084288"},
-                },
-            ],
-        }
-        (spyrecode_dir / "spyrecode.json").write_text(json.dumps(spyrecode_json))
-        (spyrecode_dir / "init_binary.bin").write_bytes(b"\x00" * 1024)
-
-        job_plan = torch_spyre._C.prepare_kernel(str(spyrecode_dir))
-
-        assert job_plan.get_step_stream_role(0) == "Prep", (
-            "HostCompute must carry Prep role so the launch router sends it to S_prep"
-        )
-        assert job_plan.get_step_stream_role(1) == "Dev", (
-            "Compute must carry Dev role so it always runs on the launch stream"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Section 2 — S_prep routing (C3/C5: tracker on queues work to S_prep; off does not)
+# Section 1 — S_prep routing (C3/C5: tracker on queues work to S_prep; off does not)
 # ---------------------------------------------------------------------------
 
 
