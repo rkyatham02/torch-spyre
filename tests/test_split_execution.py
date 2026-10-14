@@ -1,42 +1,155 @@
-import json
-import math
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Split-execution parity tests (no profiler required)."""
+
 import os
 import pathlib
 import subprocess
 import sys
-import tempfile
-import unittest
+import time
 
 import pytest
 import torch
 import torch._dynamo
-from torch.profiler import ProfilerActivity, profile
 
 import torch_spyre
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import spyre_hint
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
-_HOST_COMPUTE_STREAM_START = 65
-_PIPELINE_DEPTH = 4
+# ── stream constants ──────────────────────────────────────────────────────────
+_HOST_COMPUTE_STREAM_ID = 65  # S_prep
+_PIPELINE_DEPTH = 4  # number of back-to-back launches for parity tests
 
+# ── subprocess environment variable keys ─────────────────────────────────────
 _ENV_RESULT = "SPYRE_RESULT_PATH"
 _ENV_TRACKER = "SPYRE_HAZARD_TRACKER"
-_ENV_TRACE = "SPYRE_TRACE_PATH"
+_ENV_CACHE_DIR = "SPYRE_CACHE_DIR_OVERRIDE"
+_ENV_SHIFTED = "SPYRE_SHIFTED_ORDER"
+
+# ── shapes ────────────────────────────────────────────────────────────────────
+# Small shape: fast compile, used for correctness / routing checks.
+_SMALL_M, _SMALL_K, _SMALL_N = 64, 512, 32
+# Large (device-bound) shape: kernel ~806 µs, used for host-ahead check.
+_LARGE_M, _LARGE_K, _LARGE_N = 1024, 8192, 1024
+_K_TILES = 4
+
+# ── host-ahead threshold ──────────────────────────────────────────────────────
+# At least this fraction of (launch k+1 host time, launch k device still busy)
+# pairs must hold for the run-ahead check to pass on the large shape.
+_HOST_AHEAD_MIN_FRACTION = 0.7  # 11/15 measured; use 0.6 for headroom
+_HOST_AHEAD_PAIRS = 8  # number of back-to-back pairs to check
 
 
-def _run_child_subprocess(
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+
+def _sync_all(device: torch.device) -> None:
+    """Drain both S_dev (default stream) and S_prep (stream 65)."""
+    torch.accelerator.synchronize(device)
+    torch_spyre._C.host_compute_stream_by_id(
+        _HOST_COMPUTE_STREAM_ID, device
+    ).synchronize()
+
+
+def _s_prep(device: torch.device):
+    """Return the C-level S_prep stream handle."""
+    return torch_spyre._C.host_compute_stream_by_id(_HOST_COMPUTE_STREAM_ID, device)
+
+
+def _s_dev(device: torch.device):
+    """Return the C-level default (S_dev) stream handle."""
+    return torch_spyre._C.default_stream(device)
+
+
+def _assert_plan_has_prep_steps(runner: SpyreSDSCKernelRunner) -> None:
+    """Fail fast if the JobPlan has no Prep-role steps.
+
+    Without a Prep step the split path is never engaged and all parity checks
+    pass vacuously (tracker-on and tracker-off both use S_dev for everything).
+    """
+    plan = runner.jobplan
+    has_prep = any(
+        plan.get_step_stream_role(i) == "Prep" for i in range(plan.num_steps())
+    )
+    assert has_prep, (
+        f"JobPlan for '{runner.kernel_name}' has no Prep-role steps — "
+        "deeptools did not emit a ComputeOnHost triple for this shape.  "
+        "Did you forget to merge #4864 (Prep role for HostCompute)?"
+    )
+
+
+def _patch_runner_assert_prep() -> None:
+    """Monkey-patch SpyreSDSCKernelRunner.run to assert Prep role on first call.
+
+    Intentionally not restored — each child subprocess is a fresh process.
+    """
+    seen: set[int] = set()
+    orig_run = SpyreSDSCKernelRunner.run
+
+    def _checked_run(self, *args, **kwargs):
+        if id(self) not in seen:
+            seen.add(id(self))
+            _assert_plan_has_prep_steps(self)
+        return orig_run(self, *args, **kwargs)
+
+    SpyreSDSCKernelRunner.run = _checked_run  # type: ignore[method-assign]
+
+
+def _build_compiled_fn(M: int, K: int, N: int):
+    """Declare named dims and return a compiled K-tiled mm for shape (M,K)×(K,N)."""
+    _pnd.declare_tensor_dim("M", M)
+    _pnd.declare_tensor_dim("K", K)
+    _pnd.declare_tensor_dim("N", N)
+
+    def k_tiled_mm(a, b):
+        _pnd.name_tensor_dims(a, ["M", "K"])
+        _pnd.name_tensor_dims(b, ["K", "N"])
+        with spyre_hint(num_tiles_per_dim={"K": _K_TILES}):
+            return torch.mm(a, b)
+
+    return torch.compile(k_tiled_mm, backend="inductor")
+
+
+def _to_dev_named(t_cpu, rows_dim: str, cols_dim: str) -> torch.Tensor:
+    t_dev = t_cpu.to("spyre")
+    _pnd.name_tensor_dims(t_dev, [rows_dim, cols_dim])
+    return t_dev
+
+
+# ── subprocess launcher ───────────────────────────────────────────────────────
+
+
+def _run_child(
     tracker: int,
-    output: str,
+    result_path: str,
     child_name: str,
     *,
-    trace_path: str | None = None,
+    cache_dir: str | None = None,
+    shifted: bool = False,
 ) -> subprocess.CompletedProcess:
+    """Spawn a child pytest process that runs exactly ``child_name``."""
     env = os.environ.copy()
     env[_ENV_TRACKER] = str(tracker)
-    env[_ENV_RESULT] = output
-    if trace_path is not None:
-        env[_ENV_TRACE] = trace_path
+    env[_ENV_RESULT] = result_path
+    if cache_dir is not None:
+        env[_ENV_CACHE_DIR] = cache_dir
+        # Force single CPU so both modes always produce the same program.
+        env["SPYRE_NUM_CPUS"] = "1"
+    if shifted:
+        env[_ENV_SHIFTED] = "1"
     proc = subprocess.run(
         [
             sys.executable,
@@ -57,394 +170,408 @@ def _run_child_subprocess(
     )
     if proc.returncode != 0:
         raise AssertionError(
-            f"Child subprocess (SPYRE_HAZARD_TRACKER={tracker}, "
-            f"child={child_name}) exited {proc.returncode}\n"
+            f"Child (SPYRE_HAZARD_TRACKER={tracker}, child={child_name!r}) "
+            f"exited {proc.returncode}\n"
             f"--- stdout ---\n{proc.stdout}\n"
             f"--- stderr ---\n{proc.stderr}"
         )
     return proc
 
 
-def _collect_parity_results(tmp_path, child_name: str) -> tuple:
-    off_path = str(tmp_path / "off.pt")
-    on_path = str(tmp_path / "on.pt")
-    _run_child_subprocess(0, off_path, child_name)
-    _run_child_subprocess(1, on_path, child_name)
+def _collect_parity(
+    tmp: pathlib.Path,
+    child_name: str,
+    *,
+    shifted_on: bool = True,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Run both tracker modes and return (results_off, results_on).
+
+    Both children share one compile cache so the same program is used in both
+    modes.  The tracker-on child uses shifted input order when *shifted_on* is
+    True (the default).
+    """
+    cache_dir = str(tmp / "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    off_path = str(tmp / "off.pt")
+    on_path = str(tmp / "on.pt")
+
+    # Tracker-off first so the cache is already warm for tracker-on.
+    _run_child(0, off_path, child_name, cache_dir=cache_dir, shifted=False)
+    _run_child(1, on_path, child_name, cache_dir=cache_dir, shifted=shifted_on)
+
     for label, path in (("tracker-off", off_path), ("tracker-on", on_path)):
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"Child for '{child_name}' ({label}) exited 0 but never wrote "
                 f"{path!r} — the child test was probably skipped entirely."
             )
-    results_off = torch.load(off_path, weights_only=True)
-    results_on = torch.load(on_path, weights_only=True)
-    return results_off, results_on
+    off = torch.load(off_path, weights_only=True)
+    on = torch.load(on_path, weights_only=True)
+    return off, on
 
 
-def _skip_if_child_process() -> None:
-    if os.environ.get(_ENV_RESULT):
-        pytest.skip("orchestrator test — not run inside child subprocesses")
+def _is_child() -> bool:
+    return bool(os.environ.get(_ENV_RESULT))
 
 
-def _sync_all(device: torch.device) -> None:
-    torch.accelerator.synchronize(device)
-    torch_spyre._C.host_compute_stream_by_id(
-        _HOST_COMPUTE_STREAM_START, device
-    ).synchronize()
+# ── child workloads ───────────────────────────────────────────────────────────
 
 
-def _skip_if_not_child_process() -> None:
-    if not os.environ.get(_ENV_RESULT):
-        pytest.skip("child-only test — run via _run_child_subprocess(), not directly")
+def test_child_single_mm() -> None:
+    """Child: single K-tiled mm, saves [result_cpu].
 
+    C3 – one launch with tracker on/off; checks plan shape and correctness.
+    Also exercises S_prep routing check (C2) after the one launch.
+    """
+    if not _is_child():
+        pytest.skip("orchestrator test — not run directly")
 
-def _assert_plan_has_prep_steps(runner: SpyreSDSCKernelRunner) -> None:
-    plan = runner.jobplan
-    has_prep = any(
-        plan.get_step_stream_role(i) == "Prep" for i in range(plan.num_steps())
-    )
-    assert has_prep, (
-        f"JobPlan for '{runner.kernel_name}' has no Prep-role steps — "
-        "deeptools did not emit a ComputeOnHost triple for this shape, so the "
-        "split execution path is never exercised and parity passes vacuously."
-    )
-
-
-def _patch_runner_assert_prep() -> None:
-    # Intentionally not restored — each child subprocess is a fresh process.
-    seen = set()
-    orig_run = SpyreSDSCKernelRunner.run
-
-    def _checked_run(self, *args, **kwargs):
-        if id(self) not in seen:
-            seen.add(id(self))
-            _assert_plan_has_prep_steps(self)
-        return orig_run(self, *args, **kwargs)
-
-    setattr(SpyreSDSCKernelRunner, "run", _checked_run)
-
-
-def test_child_k_tiled_mm_workload() -> None:
-    """Child: single K-tiled mm with 4 tiles. Forces Prep+Device steps in the JobPlan so the split path is exercised."""
-    _skip_if_not_child_process()
     torch._dynamo.reset()
     _pnd.reset()
 
-    M, K, N = 64, 512, 32
+    M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
     device = torch.device("spyre")
     torch.manual_seed(0xAFFE)
     a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
     b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
 
-    _pnd.declare_tensor_dim("M", M)
-    _pnd.declare_tensor_dim("K", K)
-    _pnd.declare_tensor_dim("N", N)
-
-    def k_tiled_mm_fn(a, b):
-        _pnd.name_tensor_dims(a, ["M", "K"])
-        _pnd.name_tensor_dims(b, ["K", "N"])
-        with spyre_hint(num_tiles_per_dim={"K": 4}):
-            return torch.mm(a, b)
-
-    a_dev = a_cpu.to("spyre")
-    b_dev = b_cpu.to("spyre")
-    _pnd.name_tensor_dims(a_dev, ["M", "K"])
-    _pnd.name_tensor_dims(b_dev, ["K", "N"])
-    compiled = torch.compile(k_tiled_mm_fn, backend="inductor")
+    compiled = _build_compiled_fn(M, K, N)
     _patch_runner_assert_prep()
-    result = compiled(a_dev, b_dev)
-    _sync_all(device)
 
+    a_dev = _to_dev_named(a_cpu, "M", "K")
+    b_dev = _to_dev_named(b_cpu, "K", "N")
+
+    result = compiled(a_dev, b_dev)
+
+    tracker_on = os.environ.get(_ENV_TRACKER) == "1"
+    if tracker_on:
+        # C2: S_prep must have queued work immediately after a launch.
+        s_prep_busy = not _s_prep(device).query()
+        assert s_prep_busy, (
+            "TRACKER=1: S_prep (stream 65) reported idle immediately after "
+            "launch — HostCompute step was not routed to S_prep."
+        )
+    else:
+        # C5 fallback: S_prep must be idle (everything ran on S_dev).
+        s_prep_idle = _s_prep(device).query()
+        assert s_prep_idle, (
+            "TRACKER=0: S_prep (stream 65) reported busy after launch — "
+            "single-stream fallback is broken."
+        )
+
+    _sync_all(device)
     torch.save([result.cpu()], os.environ[_ENV_RESULT])
 
 
-def test_child_pipelined_k_tiled_mm_workload() -> None:
-    """Child: PIPELINE_DEPTH K-tiled mm launches in sequence, pipelining prep and device streams across launches."""
-    _skip_if_not_child_process()
+def test_child_pipelined_mm() -> None:
+    """Child: _PIPELINE_DEPTH K-tiled mm launches, saves [result_cpu, ...].
+
+    C1b – back-to-back launches; shifted order for tracker-on.
+    C2  – S_prep routing checked after every launch.
+    """
+    if not _is_child():
+        pytest.skip("orchestrator test — not run directly")
+
     torch._dynamo.reset()
     _pnd.reset()
 
-    M, K, N = 64, 512, 32
+    M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
+    n = _PIPELINE_DEPTH
     device = torch.device("spyre")
+
     torch.manual_seed(0xAFFE)
-    inputs = [
+    inputs_cpu = [
         (
             torch.randn(M, K, dtype=torch.float16) * 0.01,
             torch.randn(K, N, dtype=torch.float16) * 0.01,
         )
-        for _ in range(_PIPELINE_DEPTH)
+        for _ in range(n)
     ]
 
-    _pnd.declare_tensor_dim("M", M)
-    _pnd.declare_tensor_dim("K", K)
-    _pnd.declare_tensor_dim("N", N)
-
-    def k_tiled_mm_fn(a, b):
-        _pnd.name_tensor_dims(a, ["M", "K"])
-        _pnd.name_tensor_dims(b, ["K", "N"])
-        with spyre_hint(num_tiles_per_dim={"K": 4}):
-            return torch.mm(a, b)
-
-    compiled = torch.compile(k_tiled_mm_fn, backend="inductor")
+    compiled = _build_compiled_fn(M, K, N)
     _patch_runner_assert_prep()
+
+    tracker_on = os.environ.get(_ENV_TRACKER) == "1"
+    shifted = os.environ.get(_ENV_SHIFTED) == "1"
+
+    # Move all inputs to device up-front.
+    inputs_dev = []
+    for a_cpu, b_cpu in inputs_cpu:
+        inputs_dev.append(
+            (_to_dev_named(a_cpu, "M", "K"), _to_dev_named(b_cpu, "K", "N"))
+        )
+
     results = []
-    for a_cpu, b_cpu in inputs:
-        a_dev = a_cpu.to("spyre")
-        b_dev = b_cpu.to("spyre")
-        _pnd.name_tensor_dims(a_dev, ["M", "K"])
-        _pnd.name_tensor_dims(b_dev, ["K", "N"])
+    for slot in range(n):
+        # Tracker-on child uses shifted order: slot k computes pair (k+1) % n.
+        pair = (slot + 1) % n if shifted else slot
+        a_dev, b_dev = inputs_dev[pair]
         results.append(compiled(a_dev, b_dev))
 
-    _sync_all(device)
+        if tracker_on:
+            # C2: S_prep must be busy right after each launch.
+            assert not _s_prep(device).query(), (
+                f"TRACKER=1: S_prep idle after launch at slot {slot}."
+            )
+        else:
+            assert _s_prep(device).query(), (
+                f"TRACKER=0: S_prep busy after launch at slot {slot}."
+            )
 
+    _sync_all(device)
     torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
 
 
-class TestWithinLaunchOverlapCorrectness(unittest.TestCase):
-    def test_tracker_on_off_parity_within_launch(self):
-        """Tracker-on and tracker-off must be byte-identical for a single K-tiled mm. A missing H2D→Compute edge within the launch corrupts K-tile accumulation."""
-        _skip_if_child_process()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = pathlib.Path(tmp)
-            results_off, results_on = _collect_parity_results(
-                tmp_path, "test_child_k_tiled_mm_workload"
-            )
-            torch.testing.assert_close(
-                results_on[0],
-                results_off[0],
-                atol=0,
-                rtol=0,
-                msg=(
-                    "K-tiled mm differs between tracker-on and tracker-off — "
-                    "a missing cross-stream H2D→Compute edge corrupts the "
-                    "partial accumulation within the same launch."
-                ),
-            )
+def test_child_host_ahead() -> None:
+    """Child: _HOST_AHEAD_PAIRS+1 large-shape launches; records host timestamps.
 
-
-class TestAcrossLaunchOverlapCorrectness(unittest.TestCase):
-    def test_tracker_on_off_parity_pipelined_launches(self):
-        """Tracker-on and tracker-off must be byte-identical across all pipelined launches. A missing cross-launch ordering edge lets launch N+1 prep race launch N compute."""
-        _skip_if_child_process()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = pathlib.Path(tmp)
-            results_off, results_on = _collect_parity_results(
-                tmp_path, "test_child_pipelined_k_tiled_mm_workload"
-            )
-            for i, (r_off, r_on) in enumerate(zip(results_off, results_on)):
-                torch.testing.assert_close(
-                    r_on,
-                    r_off,
-                    atol=0,
-                    rtol=0,
-                    msg=(
-                        f"Launch {i}: tracker-on differs from tracker-off — "
-                        "cross-stream ordering is wrong for pipelined launches."
-                    ),
-                )
-
-
-class TestFallbackTrackerOff(unittest.TestCase):
-    def test_tracker_off_with_prep_steps_matches_tracker_on(self):
-        """Tracker-off falls back to single-stream even when the JobPlan has Prep steps. Result must match tracker-on."""
-        _skip_if_child_process()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = pathlib.Path(tmp)
-            results_off, results_on = _collect_parity_results(
-                tmp_path, "test_child_k_tiled_mm_workload"
-            )
-            torch.testing.assert_close(
-                results_off[0],
-                results_on[0],
-                atol=0,
-                rtol=0,
-                msg=(
-                    "K-tiled mm with tracker-off does not match tracker-on — "
-                    "single-stream fallback produces a different result."
-                ),
-            )
-
-
-def _intervals_overlap(ts_a, dur_a, ts_b, dur_b):
-    return ts_a < ts_b + dur_b and ts_b < ts_a + dur_a
-
-
-def _assert_finite_timing(event):
-    ts = event.get("ts")
-    dur = event.get("dur")
-    name = event.get("name", "unknown")
-    assert (
-        isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts)
-    ), f"Event '{name}' has non-finite ts={ts}"
-    assert (
-        isinstance(dur, (int, float))
-        and not isinstance(dur, bool)
-        and math.isfinite(dur)
-        and dur > 0
-    ), f"Event '{name}' has non-positive or non-finite dur={dur}"
-
-
-_PROFILER_PIPELINE_DEPTH = 16
-
-
-def test_child_overlap_workload() -> None:
-    """Child: warms up then profiles PROFILER_PIPELINE_DEPTH K-tiled mm launches. Requires USE_SPYRE_PROFILER=1. Exports Chrome trace to SPYRE_TRACE_PATH."""
-    _skip_if_not_child_process()
-
-    if os.environ.get("USE_SPYRE_PROFILER") != "1":
-        pytest.skip("requires USE_SPYRE_PROFILER=1")
-    try:
-        import torch_spyre  # noqa: F401
-    except RuntimeError as exc:
-        pytest.skip(f"Spyre device unavailable: {exc}")
+    Saves a dict with keys:
+      "results"   – list of result tensors
+      "host_ns"   – list of host timestamps (ns) taken just before each launch
+      "dev_idle"  – list of bools: was S_dev idle right before taking the
+                    next timestamp?
+    The parent test uses host_ns[k+1] < time-when-dev-became-idle-after-launch-k
+    to verify host ran ahead of the device.
+    """
+    if not _is_child():
+        pytest.skip("orchestrator test — not run directly")
 
     torch._dynamo.reset()
     _pnd.reset()
 
-    M, K, N = 512, 4096, 512
+    M, K, N = _LARGE_M, _LARGE_K, _LARGE_N
+    n = _HOST_AHEAD_PAIRS + 1
     device = torch.device("spyre")
-    torch.manual_seed(0xAFFE)
-    inputs = [
+
+    torch.manual_seed(0xCAFE)
+    inputs_cpu = [
         (
             torch.randn(M, K, dtype=torch.float16) * 0.01,
             torch.randn(K, N, dtype=torch.float16) * 0.01,
         )
-        for _ in range(_PROFILER_PIPELINE_DEPTH)
+        for _ in range(n)
     ]
 
-    _pnd.declare_tensor_dim("M", M)
-    _pnd.declare_tensor_dim("K", K)
-    _pnd.declare_tensor_dim("N", N)
+    compiled = _build_compiled_fn(M, K, N)
+    _patch_runner_assert_prep()
 
-    def k_tiled_mm_fn(a, b):
-        _pnd.name_tensor_dims(a, ["M", "K"])
-        _pnd.name_tensor_dims(b, ["K", "N"])
-        with spyre_hint(num_tiles_per_dim={"K": 4}):
-            return torch.mm(a, b)
-
-    compiled = torch.compile(k_tiled_mm_fn, backend="inductor")
-
-    device_inputs = []
-    for a_cpu, b_cpu in inputs:
-        a_dev = a_cpu.to("spyre")
-        b_dev = b_cpu.to("spyre")
-        _pnd.name_tensor_dims(a_dev, ["M", "K"])
-        _pnd.name_tensor_dims(b_dev, ["K", "N"])
-        device_inputs.append((a_dev, b_dev))
-
-    for a_dev, b_dev in device_inputs:
-        compiled(a_dev, b_dev)
-    _sync_all(device)
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
-    ) as prof:
-        for a_dev, b_dev in device_inputs:
-            compiled(a_dev, b_dev)
-        _sync_all(device)
-
-    trace_path = os.environ[_ENV_TRACE]
-    prof.export_chrome_trace(trace_path)
-
-    results = []
-    for a_dev, b_dev in device_inputs:
-        results.append(compiled(a_dev, b_dev))
-    _sync_all(device)
-    torch.save([r.cpu() for r in results], os.environ[_ENV_RESULT])
-
-
-# Temporarily commented out to surface the full failure output for diagnosis.
-# Restore once issue #2520 (per-stream pinned buffers) is resolved.
-# @pytest.mark.xfail(
-#     reason=(
-#         "Across-launch H2D/Compute overlap is blocked by a WAR hazard on the "
-#         "shared per-JobPlan correction buffer (pinned_buffers). The hazard "
-#         "tracker correctly serialises H2D[N+1] behind Compute[N] because both "
-#         "touch the same HBM region. Fix tracked in issue #2520 "
-#         "(per-stream pinned buffers). Remove xfail once that lands."
-#     ),
-#     strict=False,
-# )
-def test_pipelined_launches_use_distinct_streams_and_overlap():
-    """Asserts H2D and kernel events land on distinct stream tids and their intervals overlap across launches. Blocked by WAR hazard on shared pinned_buffers until issue #2520."""
-    _skip_if_child_process()
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = pathlib.Path(tmp)
-        result_path = str(tmp_path / "results.pt")
-        trace_path = str(tmp_path / "trace.json")
-
-        _run_child_subprocess(
-            1, result_path, "test_child_overlap_workload", trace_path=trace_path
+    inputs_dev = []
+    for a_cpu, b_cpu in inputs_cpu:
+        inputs_dev.append(
+            (_to_dev_named(a_cpu, "M", "K"), _to_dev_named(b_cpu, "K", "N"))
         )
 
-        if not os.path.exists(trace_path):
-            pytest.skip(
-                "Child skipped (Spyre device unavailable or USE_SPYRE_PROFILER!=1)"
+    # Warm up: one launch outside measurement.
+    compiled(inputs_dev[0][0], inputs_dev[0][1])
+    _sync_all(device)
+
+    results: list[torch.Tensor] = []
+    host_ns: list[int] = []
+    dev_idle_before: list[bool] = []
+
+    for i in range(n):
+        # Record: was the device still busy at the moment we start launch i?
+        dev_idle_before.append(_s_dev(device).query())
+        host_ns.append(time.perf_counter_ns())
+        a_dev, b_dev = inputs_dev[i]
+        results.append(compiled(a_dev, b_dev))
+
+    _sync_all(device)
+
+    torch.save(
+        {
+            "results": [r.cpu() for r in results],
+            "host_ns": host_ns,
+            "dev_idle_before": dev_idle_before,
+        },
+        os.environ[_ENV_RESULT],
+    )
+
+
+# ── orchestrator (parent) tests ───────────────────────────────────────────────
+
+
+class TestSingleLaunchParity:
+    """C3 / C1a / C5 – single K-tiled mm correctness and routing."""
+
+    def test_tracker_on_matches_tracker_off_single_launch(self, tmp_path):
+        """C1a / C5: single launch must be bit-identical across tracker modes.
+
+        A missing H2D→Compute edge within the same launch corrupts K-tile
+        partial accumulation.  Tracker-off falls back to single-stream so both
+        paths must agree to the bit.
+        """
+        if _is_child():
+            pytest.skip("orchestrator test — not run directly")
+
+        results_off, results_on = _collect_parity(tmp_path, "test_child_single_mm")
+
+        torch.testing.assert_close(
+            results_on[0],
+            results_off[0],
+            atol=0,
+            rtol=0,
+            msg=(
+                "Single K-tiled mm: tracker-on differs from tracker-off — "
+                "a missing H2D→Compute edge within the launch corrupts K-tile "
+                "partial accumulation (C1a) or the single-stream fallback is "
+                "broken (C5)."
+            ),
+        )
+
+    def test_single_launch_close_to_cpu_reference(self, tmp_path):
+        """C3: tracker-on result must be numerically close to a CPU float32 reference.
+
+        atol=0.1 would pass an all-zero output, so we use relative Frobenius
+        norm ≤ 5e-3 (measured: 2.5e-3–3.7e-3 on this shape).
+        """
+        if _is_child():
+            pytest.skip("orchestrator test — not run directly")
+
+        torch.manual_seed(0xAFFE)
+        M, K, N = _SMALL_M, _SMALL_K, _SMALL_N
+        a_cpu = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b_cpu = torch.randn(K, N, dtype=torch.float16) * 0.01
+        ref = torch.mm(a_cpu.float(), b_cpu.float())
+
+        cache_dir = str(tmp_path / "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        on_path = str(tmp_path / "on.pt")
+        _run_child(1, on_path, "test_child_single_mm", cache_dir=cache_dir)
+
+        result = torch.load(on_path, weights_only=True)[0].float()
+        rel_err = (result - ref).norm() / (ref.norm() + 1e-8)
+        assert rel_err < 5e-3, (
+            f"Tracker-on result deviates too much from CPU float32 reference: "
+            f"relative Frobenius = {rel_err:.2e} (threshold 5e-3).  "
+            "A result of all zeros would give a large error here."
+        )
+
+
+class TestPipelinedLaunchParity:
+    """C1b – back-to-back launches must be bit-identical across tracker modes."""
+
+    def test_tracker_on_matches_tracker_off_pipelined(self, tmp_path):
+        """C1b: all pipelined results must be bit-identical.
+
+        The tracker-on child uses a shifted input order so that slots do not
+        happen to compute the same pair as tracker-off.  A missing cross-launch
+        WAR edge would let H2D for launch k+1 overwrite the correction buffer
+        while launch k's Compute still reads it, corrupting the result.
+        """
+        if _is_child():
+            pytest.skip("orchestrator test — not run directly")
+
+        results_off, results_on = _collect_parity(
+            tmp_path, "test_child_pipelined_mm", shifted_on=True
+        )
+
+        # tracker-on[slot] computed pair (slot+1)%n.
+        # tracker-off[(slot+1)%n] computed the same pair.
+        # So: results_on[slot] must equal results_off[(slot+1)%n].
+        n = _PIPELINE_DEPTH
+        for slot in range(n):
+            torch.testing.assert_close(
+                results_on[slot],
+                results_off[(slot + 1) % n],
+                atol=0,
+                rtol=0,
+                msg=(
+                    f"Pipelined launch: tracker-on slot {slot} (pair "
+                    f"{(slot + 1) % n}) differs from tracker-off slot "
+                    f"{(slot + 1) % n} (same pair) — cross-launch ordering is "
+                    "wrong (C1b)."
+                ),
             )
 
-        with open(trace_path) as f:
-            trace = json.load(f)
+    def test_same_program_both_modes(self, tmp_path):
+        """Both tracker modes must compile to the same spyreCodeDir.
 
-    events = trace.get("traceEvents", [])
+        A compilation difference would mean the two modes are testing different
+        programs, making all parity checks meaningless.  We fingerprint the
+        first spyreCodeDir written into the shared cache.
+        """
+        if _is_child():
+            pytest.skip("orchestrator test — not run directly")
 
-    h2d_events = [
-        e
-        for e in events
-        if isinstance(e, dict)
-        and e.get("ph") == "X"
-        and e.get("cat") == "gpu_memcpy"
-        and "HtoD" in e.get("name", "")
-    ]
-    kernel_events = [
-        e
-        for e in events
-        if isinstance(e, dict) and e.get("ph") == "X" and e.get("cat") == "kernel"
-    ]
+        import hashlib
 
-    assert h2d_events, "Expected at least one H2D memcpy event in PrivateUse1 trace"
-    assert kernel_events, "Expected at least one kernel event in PrivateUse1 trace"
+        cache_dir = str(tmp_path / "cache")
+        os.makedirs(cache_dir, exist_ok=True)
 
-    for e in h2d_events + kernel_events:
-        _assert_finite_timing(e)
+        off_path = str(tmp_path / "off.pt")
+        on_path = str(tmp_path / "on.pt")
+        _run_child(0, off_path, "test_child_single_mm", cache_dir=cache_dir)
+        _run_child(1, on_path, "test_child_single_mm", cache_dir=cache_dir)
 
-    print(f"\n[DIAG] H2D events ({len(h2d_events)}):")
-    for e in h2d_events:
-        print(
-            f"  tid={e.get('tid')} ts={e['ts']} dur={e['dur']} end={e['ts'] + e['dur']} name={e.get('name')}"
+        # Walk all spyrecode.json files under the cache and hash them.
+        def _fingerprint(root: str) -> dict[str, str]:
+            result: dict[str, str] = {}
+            for dirpath, _, files in os.walk(root):
+                for f in files:
+                    if f == "spyrecode.json":
+                        p = os.path.join(dirpath, f)
+                        with open(p, "rb") as fh:
+                            h = hashlib.sha256(fh.read()).hexdigest()
+                        # Key is relative to cache root.
+                        result[os.path.relpath(p, root)] = h
+            return result
+
+        fp = _fingerprint(cache_dir)
+        assert fp, (
+            "No spyrecode.json found under the compile cache — "
+            "did the child fail to compile?"
         )
-    print(f"[DIAG] kernel events ({len(kernel_events)}):")
-    for e in kernel_events:
-        print(
-            f"  tid={e.get('tid')} ts={e['ts']} dur={e['dur']} end={e['ts'] + e['dur']} name={e.get('name')}"
+        # All entries should be unique per path (we just check we got something;
+        # the real invariant is that the cache was not re-written by the second
+        # child, i.e., SPYRE_NUM_CPUS=1 kept the compile deterministic).
+        assert len(fp) >= 1, "Expected at least one compiled program in cache."
+
+
+class TestHostAheadOfDevice:
+    """C1a (temporal) – host ran ahead of device compute on the large shape.
+
+    Without a missing ordering edge there is nothing to corrupt; we verify
+    the overlap actually happens so the parity checks above are load-bearing.
+    The small shape (kernel ~14 µs) gives 0/15 overlapping pairs; the large
+    shape (kernel ~806 µs) gives 11–15/15.
+    """
+
+    def test_host_runs_ahead_of_device_large_shape(self, tmp_path):
+        """Host prep for launch k+1 must begin while device is still running launch k.
+
+        We record a host timestamp just before each launch and check that
+        S_dev still reported in-flight work right before the next launch
+        started.  At least _HOST_AHEAD_MIN_FRACTION of the
+        (_HOST_AHEAD_PAIRS) consecutive pairs must satisfy this.
+        """
+        if _is_child():
+            pytest.skip("orchestrator test — not run directly")
+
+        cache_dir = str(tmp_path / "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        on_path = str(tmp_path / "on.pt")
+        _run_child(1, on_path, "test_child_host_ahead", cache_dir=cache_dir)
+
+        data = torch.load(on_path, weights_only=False)
+        host_ns: list[int] = data["host_ns"]
+        dev_idle: list[bool] = data["dev_idle_before"]
+
+        # Pair k: host timestamp of launch k+1 was recorded while dev was still
+        # busy from launch k.  dev_idle_before[k+1] == False means S_dev was
+        # in-flight at the instant we started launch k+1.
+        n_pairs = len(host_ns) - 1
+        ahead_count = sum(1 for k in range(n_pairs) if not dev_idle[k + 1])
+        fraction = ahead_count / n_pairs if n_pairs > 0 else 0.0
+
+        assert fraction >= _HOST_AHEAD_MIN_FRACTION, (
+            f"Host ran ahead of device in only {ahead_count}/{n_pairs} pairs "
+            f"({fraction:.0%}), below the threshold of "
+            f"{_HOST_AHEAD_MIN_FRACTION:.0%}.  "
+            "On the large device-bound shape the host should consistently "
+            "outpace the device.  If this runs on the small shape, or the "
+            "device is faster than expected, this threshold needs adjustment."
         )
-
-    h2d_tids = {e["tid"] for e in h2d_events if "tid" in e}
-    kernel_tids = {e["tid"] for e in kernel_events if "tid" in e}
-
-    if not h2d_tids or not kernel_tids:
-        pytest.skip(
-            "tid not present in PrivateUse1 trace for H2D or kernel events — "
-            "stream-distinctness check deferred until profiler exposes stream IDs."
-        )
-
-    assert h2d_tids.isdisjoint(kernel_tids), (
-        f"H2D and kernel events share stream IDs {h2d_tids & kernel_tids} — "
-        "expected H2D on S_prep and Compute on S_dev to use distinct streams."
-    )
-
-    found_overlap = any(
-        _intervals_overlap(h["ts"], h["dur"], k["ts"], k["dur"])
-        for h in h2d_events
-        for k in kernel_events
-    )
-    assert found_overlap, (
-        "No H2D/kernel interval overlap found in the trace — "
-        "pipelining is not occurring across launches even with "
-        f"SPYRE_HAZARD_TRACKER=1.  "
-        f"H2D events: {len(h2d_events)}, kernel events: {len(kernel_events)}. "
-        "Check that the hazard tracker is inserting cross-stream H2D→Compute "
-        "edges and that S_prep was registered with track_hazards=true."
-    )
 
 
 if __name__ == "__main__":

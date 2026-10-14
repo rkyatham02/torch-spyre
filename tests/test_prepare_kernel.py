@@ -400,6 +400,17 @@ class TestPrepareKernel:
             assert job_plan.get_step_type(0) == "HostCompute"
             assert job_plan.get_step_type(1) == "Compute"
 
+            # Verify the stream roles: HostCompute → Prep, Compute → Dev.
+            # This is the invariant that #4864 established; without it the
+            # split-execution tests pass vacuously (both steps run on S_dev).
+            assert job_plan.get_step_stream_role(0) == "Prep", (
+                "HostCompute step must carry role='Prep' (set by #4864); "
+                "without this the hazard-tracker split is never engaged."
+            )
+            assert job_plan.get_step_stream_role(1) == "Dev", (
+                "Compute step must carry role='Dev'."
+            )
+
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
         with tempfile.TemporaryDirectory() as tmpdir:

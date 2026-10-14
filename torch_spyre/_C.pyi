@@ -428,6 +428,10 @@ class JobPlan:
         """Get the stream role for a step ('Prep' or 'Dev')"""
         ...
 
+    def get_step_pipeline_barrier(self, idx: int) -> bool:
+        """Get whether a step carries a pipeline barrier (True) or is overlap-eligible (False)"""
+        ...
+
 def launch_jobplan(
     job_plan: JobPlan,
     args: collections.abc.Sequence[torch.Tensor],
