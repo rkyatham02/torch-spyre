@@ -87,28 +87,33 @@ def shared_compile_cache(tmp_path_factory) -> pathlib.Path:
 
 _MM_M, _MM_K, _MM_N = 1024, 8192, 1024  # device-bound shape (kernel ~800 µs)
 _MM_DTYPE = torch.float16
-_ROUTING_LAUNCHES = 8  # launches per routing child; kernel ~800 µs, host ~50 µs
+_ROUTING_LAUNCHES = 8  # kernels queued; device busy for ~6.4 ms total
+_POLL_MS = 5.0  # poll window (ms); must be < _ROUTING_LAUNCHES × kernel_us/1000
 
 
 def _child_s_prep_routing(
     tracker_on: bool,
     result_queue: multiprocessing.Queue,
 ) -> None:
-    """Child: queue several mm launches, sample S_prep between them.
+    """Child: queue all launches, then immediately poll S_prep before device drains.
 
     Strategy:
-    - Warm-up so the cache is hot.
-    - Snapshot the S_prep stream ID via host_compute_stream() BEFORE the timed
-      launches.  host_compute_stream() is round-robin, so we save the ID and
-      re-fetch the same stream by ID after each launch — otherwise we'd sample
-      a different stream in the pool.
-    - Fire _ROUTING_LAUNCHES launches back-to-back without syncing.  With the
-      device-bound shape (~800 µs kernel), the device is busy for several ms
-      while Python submits the next launch.  If the tracker is on, HostCompute
-      for launch k+1 is routed to S_prep while kernel k is still running, so
-      S_prep should be non-idle at least once across all samples.
-    - Record how many samples observed S_prep busy.
+    - Warm-up so the cache is hot and the compile cache is warm.
+    - Snapshot the S_prep stream ID ONCE via host_compute_stream() — it is
+      round-robin, so we pin the ID here and use host_compute_stream_by_id for
+      all subsequent queries.
+    - Fire all _ROUTING_LAUNCHES in a tight loop WITHOUT syncing between them.
+      With a ~800 µs kernel per launch, the device needs ~N×800 µs to drain
+      all N queued kernels.  HostCompute for launch k runs inline before the
+      kernel is submitted, but its H2D DMA is queued on S_prep.  The last
+      H2D is still in flight while earlier kernels run.
+    - Immediately after the loop (before any sync) poll S_prep repeatedly
+      for up to _POLL_MS milliseconds.  With tracker on, at least one poll
+      must observe S_prep busy (H2D or WAR-wait in flight).  With tracker off,
+      all steps go to S_dev so S_prep is always idle.
     """
+    import time
+
     import torch
     import torch._dynamo
     from torch_spyre import _C
@@ -119,30 +124,35 @@ def _child_s_prep_routing(
     b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE, device=device)
 
     compiled = torch.compile(torch.mm, backend="inductor")
-    # warm-up / compile — do not count this launch
+    # warm-up / compile — not counted
     compiled(a, b)
     torch.accelerator.synchronize(device)
 
-    # Snapshot the stream ID that the *next* host_compute_stream() call will
-    # return.  We call it once here to pin the ID, then use by_id for all
-    # subsequent queries so we always look at the same stream.
+    # Pin the S_prep stream ID before the timed loop.
     s_prep_id = _C.host_compute_stream(device).id()
 
-    busy_samples = 0
+    # Fire all launches without syncing so the device has a full backlog.
     for _ in range(_ROUTING_LAUNCHES):
         compiled(a, b)
-        # Query the same stream by ID immediately — no sync, no yield.
+
+    # Immediately poll S_prep for up to _POLL_MS ms.  The device is still
+    # draining _ROUTING_LAUNCHES × ~800 µs of kernels, so if any H2D was
+    # routed there it will show up here.
+    deadline = time.monotonic() + _POLL_MS / 1000.0
+    busy_samples = 0
+    poll_count = 0
+    while time.monotonic() < deadline:
         s = _C.host_compute_stream_by_id(s_prep_id, device)
         if not s.query():
             busy_samples += 1
+        poll_count += 1
 
     torch.accelerator.synchronize(device)
     result_queue.put(
         {
             "tracker_on": tracker_on,
-            # For tracker-on we require at least one busy sample.
-            # For tracker-off we require zero.
             "busy_samples": busy_samples,
+            "poll_count": poll_count,
             "total_launches": _ROUTING_LAUNCHES,
         }
     )
@@ -296,11 +306,14 @@ class TestSPrepRouting:
             cache_dir=shared_compile_cache,
         )
         busy = result["busy_samples"]
+        polls = result["poll_count"]
         total = result["total_launches"]
         assert busy > 0, (
-            f"SPYRE_HAZARD_TRACKER=1: S_prep was idle on all {total} samples "
-            "immediately after each launch. HostCompute is not being routed to "
-            "S_prep — the split is not happening."
+            f"SPYRE_HAZARD_TRACKER=1: S_prep was idle on all {polls} polls "
+            f"({_POLL_MS} ms window after {total} queued launches). "
+            "HostCompute is not being routed to S_prep — the split is not happening. "
+            "If this is a new build, check that SPYRE_HAZARD_TRACKER=1 is being "
+            "read at runtime startup, not after the first launch."
         )
 
     def test_s_prep_has_no_queued_work_tracker_off(self, shared_compile_cache):
