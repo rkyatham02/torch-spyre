@@ -22,6 +22,7 @@ __all__: list[str] = [
     "current_stream",
     "default_stream",
     "get_device_state",
+    "get_hazard_tracker_enabled",
     "get_stream_from_pool",
     "host_compute_stream",
     "host_compute_stream_by_id",
@@ -533,6 +534,15 @@ def stream_get_error(stream: _SpyreStreamBase) -> SpyreStreamError: ...
 def stream_get_error_string(error: SpyreStreamError) -> str: ...
 def get_device_state() -> SpyreDeviceState: ...
 def start_runtime() -> None: ...
+def get_hazard_tracker_enabled() -> bool:
+    """Return True if SPYRE_HAZARD_TRACKER was set to a truthy value at startup.
+
+    When True, SpyreStream::launch routes HostCompute steps to S_prep and
+    Compute steps to S_dev (the two-stream split).  When False (the default),
+    every step runs on S_dev.
+    """
+    ...
+
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...
 def host_compute_stream(device: torch.device) -> _SpyreStreamBase:
     """Get a host-compute stream for a device (round-robin across the pool).
