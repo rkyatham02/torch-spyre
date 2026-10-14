@@ -140,13 +140,6 @@ def _apply_skew(events: list[dict], skew_us: float) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _overlaps(a: dict, b: dict) -> bool:
-    """True if event a's time range overlaps event b's time range."""
-    a_start, a_end = a["ts"], a["ts"] + a.get("dur", 0)
-    b_start, b_end = b["ts"], b["ts"] + b.get("dur", 0)
-    return a_start < b_end and b_start < a_end
-
-
 def _starts_inside(inner: dict, outer: dict) -> bool:
     """True if inner starts within outer's time range."""
     return outer["ts"] <= inner["ts"] < outer["ts"] + outer.get("dur", 0)

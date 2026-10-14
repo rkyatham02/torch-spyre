@@ -224,6 +224,8 @@ def _child_back_to_back(
     tracker-on child uses pair (k + shift) % n to vary addresses vs tracker-off.
     Outputs serialized as nested float lists — safe after child exits.
     """
+    import os
+
     import torch
     import torch._dynamo
 
@@ -266,11 +268,16 @@ def _child_back_to_back(
     outputs = [outputs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
     refs = [refs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
 
+    # Expose the compile-cache directory so the parent can assert both tracker
+    # modes compiled and ran the same program (C4: identical spyreCodeDir).
+    spyre_code_dir = os.environ.get("SPYRE_COMPILE_CACHE_DIR", "")
+
     return {
         "tracker_on": tracker_on,
         "outputs": outputs,
         "refs": refs,
         "outputs_by_pair": outputs_by_pair,
+        "spyre_code_dir": spyre_code_dir,
     }
 
 
@@ -590,6 +597,16 @@ class TestBackToBackParity:
             args=(False, _NUM_BACK_TO_BACK, 0),  # shift=0 → natural order
             env_overrides=_tracker_off_env(),
             cache_dir=shared_compile_cache,
+        )
+
+        # Both children must have used the same compiled program (C4).
+        assert result_on["spyre_code_dir"] == result_off["spyre_code_dir"], (
+            f"tracker-on and tracker-off children used different compile caches: "
+            f"on={result_on['spyre_code_dir']!r} off={result_off['spyre_code_dir']!r}"
+        )
+        assert result_on["spyre_code_dir"], (
+            "SPYRE_COMPILE_CACHE_DIR was not set in the child — "
+            "cannot verify both modes used the same program."
         )
 
         on_by_pair: dict = result_on["outputs_by_pair"]
