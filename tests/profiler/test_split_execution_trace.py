@@ -253,6 +253,23 @@ class TestSplitExecutionTrace:
             "or the span was removed (post-#3488): update this file accordingly."
         )
 
+    def test_debug_dump_timestamps(self, compiled_mm):
+        """Temporary: dump kernel and HC span timestamps to diagnose overlap failure."""
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
+        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
+        hc_spans = sorted(_host_compute_spans(result["events"]), key=lambda e: e["ts"])
+        print(f"\nskew_us={result['skew_us']:.2f}")
+        print(f"kernels ({len(kernels)}):")
+        for k in kernels:
+            print(
+                f"  ts={k['ts']:.2f} dur={k.get('dur', 0):.2f} end={k['ts'] + k.get('dur', 0):.2f} name={k.get('name', '?')}"
+            )
+        print(f"HC spans ({len(hc_spans)}):")
+        for h in hc_spans:
+            print(
+                f"  ts={h['ts']:.2f} dur={h.get('dur', 0):.2f} end={h['ts'] + h.get('dur', 0):.2f} name={h.get('name', '?')} cat={h.get('cat', '?')}"
+            )
+
     def test_host_ran_ahead_of_device(self, compiled_mm):
         """With tracker on, host prep for launch k+1 ends before kernel k ends.
 
