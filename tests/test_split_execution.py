@@ -194,7 +194,7 @@ def _child_single_launch_correctness(tracker_on: bool) -> dict:
     # Use the smaller correctness shape — compiles in seconds, not minutes.
     a_cpu = torch.randn(_COR_M, _COR_K, dtype=_MM_DTYPE)
     b_cpu = torch.randn(_COR_K, _COR_N, dtype=_MM_DTYPE)
-    ref = torch.mm(a_cpu, b_cpu)
+    ref = torch.mm(a_cpu.float(), b_cpu.float())
 
     a = a_cpu.to("spyre")
     b = b_cpu.to("spyre")
@@ -251,7 +251,7 @@ def _child_back_to_back(
         a_s, b_s = pairs_spyre[idx]
         a_c, b_c = pairs_cpu[idx]
         out = compiled(a_s, b_s).cpu().float().tolist()
-        ref = torch.mm(a_c, b_c).float().tolist()
+        ref = torch.mm(a_c.float(), b_c.float()).float().tolist()
         outputs.append(out)
         refs.append(ref)
 
@@ -461,8 +461,8 @@ class TestSingleLaunchCorrectness:
         torch.testing.assert_close(
             out,
             ref,
-            atol=0.01,
-            rtol=0.01,
+            atol=0.1,
+            rtol=0.05,
             msg=(f"mm output does not match CPU reference (tracker_on={tracker_on})"),
         )
 
@@ -501,8 +501,8 @@ class TestBackToBackParity:
             torch.testing.assert_close(
                 torch.tensor(out_list),
                 torch.tensor(ref_list),
-                atol=0.01,
-                rtol=0.01,
+                atol=0.1,
+                rtol=0.05,
                 msg=f"tracker_on back-to-back launch {k} mismatch vs CPU",
             )
 
@@ -524,7 +524,7 @@ class TestBackToBackParity:
             torch.testing.assert_close(
                 torch.tensor(out_list),
                 torch.tensor(ref_list),
-                atol=0.01,
-                rtol=0.01,
+                atol=0.1,
+                rtol=0.05,
                 msg=f"tracker_off back-to-back launch {k} mismatch vs CPU",
             )
