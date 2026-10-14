@@ -69,13 +69,13 @@ def _memcpy_events(events: list[dict]) -> list[dict]:
 def _host_compute_spans(events: list[dict]) -> list[dict]:
     """Return CPU-side launch::HostCompute spans.
 
-    flex names the span 'launch::HostCompute'; it appears as a CPU event
-    (cat=='cpu_op' or similar) not a device event.
+    flex names the span exactly 'launch::HostCompute'; it appears as a CPU
+    event (cat=='cpu_op' or similar) not a device event.
     """
     return [
         e
         for e in events
-        if "HostCompute" in e.get("name", "") and e.get("cat") != "kernel"
+        if e.get("name") == "launch::HostCompute" and e.get("cat") != "kernel"
     ]
 
 
@@ -164,7 +164,14 @@ def _ends_before(a: dict, b: dict) -> bool:
 
 @pytest.fixture(scope="module")
 def compiled_mm():
-    """Compile mm and warm up once; return the compiled callable."""
+    """Compile mm and warm up once; return the compiled callable.
+
+    Note: this fixture intentionally opens the device in the parent pytest
+    process.  Unlike test_split_execution.py (which isolates every device
+    operation in a child process), the trace tests must run the profiler in
+    the same process as the device — torch.profiler cannot span a
+    multiprocessing.Process boundary.
+    """
     torch._dynamo.reset()
     torch.manual_seed(0)
     device = torch.device("spyre")
@@ -186,6 +193,12 @@ def compiled_mm():
 def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> dict:
     """Run num_launches back-to-back mm calls under torch.profiler.
 
+    tracker_on only affects the random seed (and therefore tensor addresses);
+    the actual tracker mode is fixed at runtime startup via SPYRE_HAZARD_TRACKER
+    and cannot be changed between calls.  All trace tests run with tracker on;
+    the tracker_on=False path in test_host_compute_timing_diagnostic is for
+    diagnostic seed variation only.
+
     Returns a dict with:
       - "events": list of complete trace events (clock-skew corrected)
       - "outputs": list of mm output tensors (on CPU, float32)
@@ -202,7 +215,12 @@ def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> d
         )
         for _ in range(num_launches)
     ]
+    # Upload tensors before the profiled window so tensor-transfer H2Ds do not
+    # appear in the trace alongside correction H2Ds.  The WAR/RAW edge checks
+    # key on correction H2Ds only; mixing in input-tensor transfers would make
+    # index-aligned pairing unreliable.
     pairs_spyre = [(a.to(device), b.to(device)) for a, b in pairs_cpu]
+    torch.accelerator.synchronize(device)
 
     outputs_cpu = []
     refs = [torch.mm(a.float(), b.float()) for a, b in pairs_cpu]
@@ -239,7 +257,22 @@ def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> d
 
 @pytest.mark.requires_spyre_profiler
 class TestSplitExecutionTrace:
-    """Trace-level checks for split-execution correctness (issue #2889)."""
+    """Trace-level checks for split-execution correctness (issue #2889).
+
+    All tests in this class require SPYRE_HAZARD_TRACKER=1.  The tracker mode
+    is latched once at runtime startup (std::call_once); it cannot be toggled
+    between tests.  Set it before launching pytest:
+        SPYRE_HAZARD_TRACKER=1 USE_SPYRE_PROFILER=1 pytest ...
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_tracker_on(self):
+        import os
+
+        if os.environ.get("SPYRE_HAZARD_TRACKER") != "1":
+            pytest.skip(
+                "SPYRE_HAZARD_TRACKER=1 is required for split-execution trace tests"
+            )
 
     def test_host_compute_span_present(self, compiled_mm):
         """launch::HostCompute CPU span appears in the trace with tracker on.
@@ -328,23 +361,25 @@ class TestSplitExecutionTrace:
         assert kernels, "No kernel events — check AIUPTI."
         assert memcpys, "No memcpy (H2D) events — check AIUPTI."
 
-        # Pair each kernel with the H2D that immediately precedes it in time.
+        # Index-aligned pairing: h2ds[k] is the correction H2D for kernel[k].
+        # Tensor-upload H2Ds are excluded from the profiled window (uploads
+        # happen before the profile() context), so the only H2Ds in the trace
+        # are correction transfers — one per launch, in launch order.
+        h2ds = sorted(
+            [m for m in memcpys if "HtoD" in m.get("name", "")],
+            key=lambda e: e["ts"],
+        )
+        assert h2ds, "No HtoD memcpy events — check AIUPTI."
+
+        num_pairs = min(len(kernels), len(h2ds))
         violations = []
-        for kernel in kernels:
-            preceding_h2d = [
-                m
-                for m in memcpys
-                if "HtoD" in m.get("name", "") and m["ts"] < kernel["ts"]
-            ]
-            if not preceding_h2d:
-                continue
-            closest_h2d = max(preceding_h2d, key=lambda m: m["ts"])
-            h2d_end = closest_h2d["ts"] + closest_h2d.get("dur", 0)
-            if kernel["ts"] < h2d_end:
+        for k in range(num_pairs):
+            h2d_end = h2ds[k]["ts"] + h2ds[k].get("dur", 0)
+            if kernels[k]["ts"] < h2d_end:
                 violations.append(
-                    f"kernel ts={kernel['ts']:.3f} started before "
-                    f"its H2D ended at {h2d_end:.3f} "
-                    f"(delta={kernel['ts'] - h2d_end:.3f} µs)"
+                    f"kernel[{k}] ts={kernels[k]['ts']:.3f} started before "
+                    f"H2D[{k}] ended at {h2d_end:.3f} "
+                    f"(delta={kernels[k]['ts'] - h2d_end:.3f} µs)"
                 )
 
         assert not violations, (
