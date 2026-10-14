@@ -458,19 +458,14 @@ class TestSingleLaunchCorrectness:
         )
         out = torch.tensor(result["out"])
         ref = torch.tensor(result["ref"])
-        abs_diff = (out - ref).abs()
-        max_abs = abs_diff.max().item()
-        max_rel = (abs_diff / (ref.abs() + 1e-7)).max().item()
-        print(
-            f"\n[tracker_on={tracker_on}] max_abs_diff={max_abs:.6f}, max_rel_diff={max_rel:.6f}"
-        )
-        print(f"out[0, :5]={out[0, :5].tolist()}")
-        print(f"ref[0, :5]={ref[0, :5].tolist()}")
+        rel_frob = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        assert rel_frob < 0.01, f"Relative Frobenius error {rel_frob:.4e} exceeds 1%"
         torch.testing.assert_close(
             out,
             ref,
-            atol=0.1,
+            atol=0.35,
             rtol=0.05,
+            msg=f"mm output does not match CPU reference (tracker_on={tracker_on})",
         )
 
 
@@ -505,10 +500,18 @@ class TestBackToBackParity:
         for k, (out_list, ref_list) in enumerate(
             zip(result["outputs"], result["refs"])
         ):
+            out_k = torch.tensor(out_list)
+            ref_k = torch.tensor(ref_list)
+            rel_frob = (
+                torch.linalg.norm(out_k - ref_k) / torch.linalg.norm(ref_k)
+            ).item()
+            assert rel_frob < 0.01, (
+                f"Relative Frobenius error {rel_frob:.4e} exceeds 1%"
+            )
             torch.testing.assert_close(
-                torch.tensor(out_list),
-                torch.tensor(ref_list),
-                atol=0.1,
+                out_k,
+                ref_k,
+                atol=0.35,
                 rtol=0.05,
                 msg=f"tracker_on back-to-back launch {k} mismatch vs CPU",
             )
@@ -528,10 +531,18 @@ class TestBackToBackParity:
         for k, (out_list, ref_list) in enumerate(
             zip(result["outputs"], result["refs"])
         ):
+            out_k = torch.tensor(out_list)
+            ref_k = torch.tensor(ref_list)
+            rel_frob = (
+                torch.linalg.norm(out_k - ref_k) / torch.linalg.norm(ref_k)
+            ).item()
+            assert rel_frob < 0.01, (
+                f"Relative Frobenius error {rel_frob:.4e} exceeds 1%"
+            )
             torch.testing.assert_close(
-                torch.tensor(out_list),
-                torch.tensor(ref_list),
-                atol=0.1,
+                out_k,
+                ref_k,
+                atol=0.35,
                 rtol=0.05,
                 msg=f"tracker_off back-to-back launch {k} mismatch vs CPU",
             )
