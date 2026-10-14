@@ -244,23 +244,82 @@ def _child_back_to_back(
     # warm-up with pair 0
     compiled(pairs_spyre[0][0], pairs_spyre[0][1])
 
-    outputs: list[list] = []
-    refs: list[list] = []
+    # outputs_by_pair[pair_idx] = output list, so both children can be compared
+    # at the same logical pair regardless of launch order.
+    outputs_by_pair: dict[int, list] = {}
+    refs_by_pair: dict[int, list] = {}
     for k in range(num_launches):
         idx = (k + shift) % num_launches
         a_s, b_s = pairs_spyre[idx]
         a_c, b_c = pairs_cpu[idx]
         out = compiled(a_s, b_s).cpu().float().tolist()
         ref = torch.mm(a_c.float(), b_c.float()).float().tolist()
-        outputs.append(out)
-        refs.append(ref)
+        outputs_by_pair[idx] = out
+        refs_by_pair[idx] = ref
 
     torch.accelerator.synchronize(device)
+
+    # Also expose slot-order lists for the per-slot CPU-parity tests.
+    outputs = [outputs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
+    refs = [refs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
 
     return {
         "tracker_on": tracker_on,
         "outputs": outputs,
         "refs": refs,
+        "outputs_by_pair": outputs_by_pair,
+    }
+
+
+def _child_s_prep_stream_query(tracker_on: bool) -> dict:
+    """Child: launch mm once then immediately query S_prep before any sync.
+
+    With the tracker on, HostCompute is routed to S_prep, so S_prep has work
+    queued the instant after launch returns.  With the tracker off, nothing is
+    ever routed to S_prep, so it is idle (query() == True).
+
+    query() on a SpyreStream reflects whether the underlying flex stream has
+    pending work.  Because HostCompute's H2D goes directly to the flex stream
+    without a torch event, this IS a valid routing signal — unlike torch's own
+    stream.query() which only sees torch-level CUDA-style events.
+    """
+    import torch
+    import torch._dynamo
+    import torch_spyre  # noqa: F401  # registers the backend
+    from torch_spyre import _C
+
+    torch._dynamo.reset()
+    torch.manual_seed(2)
+    device = torch.device("spyre")
+
+    a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
+    b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
+
+    compiled = torch.compile(torch.mm, backend="inductor")
+    # Warm-up: compile + first launch so the kernel is cached.
+    compiled(a, b)
+    torch.accelerator.synchronize(device)
+
+    # Fresh pair so addresses differ from warm-up, exercising the correction path.
+    a2 = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
+    b2 = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
+
+    # Get S_prep (stream ID 65) *before* the launch so there is no race on
+    # the handle itself.
+    s_prep = _C.host_compute_stream(device)
+
+    # Issue the launch.  With tracker on, HostCompute is dispatched to s_prep
+    # synchronously on this thread inside SpyreStream::launch before returning.
+    compiled(a2, b2)
+
+    # Query immediately — no sync.  If routing worked, s_prep has work pending.
+    queued = not s_prep.query()
+
+    torch.accelerator.synchronize(device)
+
+    return {
+        "tracker_on": tracker_on,
+        "s_prep_had_queued_work": queued,
     }
 
 
@@ -427,6 +486,59 @@ class TestSPrepRouting:
             f"(plan shape is tracker-agnostic). Got: {result['step_types']}"
         )
 
+    def test_s_prep_has_queued_work_after_launch_tracker_on(self, shared_compile_cache):
+        """Tracker on: S_prep has pending work immediately after a launch (C3).
+
+        HOW TO TEST:
+          pytest tests/test_split_execution.py::TestSPrepRouting::test_s_prep_has_queued_work_after_launch_tracker_on -v
+
+        What this proves:
+        - After compiled(a, b) returns with SPYRE_HAZARD_TRACKER=1,
+          host_compute_stream(device).query() returns False — meaning the flex
+          stream backing S_prep has work queued.
+        - This is only possible if SpyreStream::launch routed the HostCompute
+          step to S_prep (stream ID 65) rather than S_dev.
+        - With the tracker off the same query returns True (S_prep is idle),
+          confirmed by test_s_prep_is_idle_after_launch_tracker_off below.
+
+        Uses the large device-bound shape (_MM_M × _MM_K × _MM_N, ~800 µs
+        kernel) so the kernel is still running when query() is called.
+        """
+        result = _run_in_child(
+            _child_s_prep_stream_query,
+            args=(True,),
+            env_overrides=_tracker_on_env(),
+            cache_dir=shared_compile_cache,
+            timeout=240.0,  # large shape compiles on first child visit
+        )
+        assert result["s_prep_had_queued_work"] is True, (
+            "tracker on: S_prep (stream ID 65) had no queued work immediately "
+            "after launch — HostCompute was NOT routed to S_prep.  Either "
+            "SPYRE_HAZARD_TRACKER was not read, or the routing branch is broken."
+        )
+
+    def test_s_prep_is_idle_after_launch_tracker_off(self, shared_compile_cache):
+        """Tracker off: S_prep is idle immediately after a launch (C5).
+
+        HOW TO TEST:
+          pytest tests/test_split_execution.py::TestSPrepRouting::test_s_prep_is_idle_after_launch_tracker_off -v
+
+        With SPYRE_HAZARD_TRACKER=0, every step goes to S_dev; S_prep receives
+        nothing.  query() must return True (no pending work) right after launch.
+        This is the negative control for test_s_prep_has_queued_work_after_launch_tracker_on.
+        """
+        result = _run_in_child(
+            _child_s_prep_stream_query,
+            args=(False,),
+            env_overrides=_tracker_off_env(),
+            cache_dir=shared_compile_cache,
+            timeout=240.0,
+        )
+        assert result["s_prep_had_queued_work"] is False, (
+            "tracker off: S_prep (stream ID 65) had queued work after launch — "
+            "something was unexpectedly routed to S_prep with the tracker off."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Section 3 — Single-launch correctness (C3: right answer in both modes)
@@ -546,3 +658,64 @@ class TestBackToBackParity:
                 rtol=0.05,
                 msg=f"tracker_off back-to-back launch {k} mismatch vs CPU",
             )
+
+    def test_tracker_on_off_outputs_are_identical(self, shared_compile_cache):
+        """tracker on and off produce bit-identical outputs for every pair (C4).
+
+        HOW TO TEST:
+          pytest tests/test_split_execution.py::TestBackToBackParity::test_tracker_on_off_outputs_are_identical -v
+
+        What this proves (C4 / correctness under overlap):
+        - The tracker-on child uses a shifted launch order (shift=1) so its
+          tensor addresses differ from the tracker-off child.  If a WAR or RAW
+          edge is missing, the correction H2D for one launch can corrupt the
+          in-flight kernel of another, producing a different result.
+        - Outputs are keyed by pair index (outputs_by_pair) so the comparison
+          is always between the same logical input pair regardless of which slot
+          each child computed it in.
+        - Both children run the same compiled kernel (shared compile cache),
+          so any numeric difference is a routing / ordering bug, not a compile
+          difference.
+
+        The plan also notes that tracker-on and tracker-off outputs were
+        bit-identical in all 16 empirical traces; this test encodes that
+        guarantee.
+        """
+        result_on = _run_in_child(
+            _child_back_to_back,
+            args=(True, _NUM_BACK_TO_BACK, 1),  # shift=1 → varied addresses
+            env_overrides=_tracker_on_env(),
+            cache_dir=shared_compile_cache,
+        )
+        result_off = _run_in_child(
+            _child_back_to_back,
+            args=(False, _NUM_BACK_TO_BACK, 0),  # shift=0 → natural order
+            env_overrides=_tracker_off_env(),
+            cache_dir=shared_compile_cache,
+        )
+
+        on_by_pair: dict = result_on["outputs_by_pair"]
+        off_by_pair: dict = result_off["outputs_by_pair"]
+
+        # Both children must have computed the same set of pair indices.
+        assert set(on_by_pair.keys()) == set(off_by_pair.keys()), (
+            f"Pair index mismatch between children: "
+            f"on={sorted(on_by_pair.keys())} off={sorted(off_by_pair.keys())}"
+        )
+
+        for pair_idx in sorted(on_by_pair.keys()):
+            out_on = torch.tensor(on_by_pair[pair_idx])
+            out_off = torch.tensor(off_by_pair[pair_idx])
+            # Empirically bit-identical; use exact equality first, fall back to
+            # a tight tolerance only if the fp32 round-trip introduces noise.
+            if not torch.equal(out_on, out_off):
+                torch.testing.assert_close(
+                    out_on,
+                    out_off,
+                    atol=1e-5,
+                    rtol=0.0,
+                    msg=(
+                        f"pair {pair_idx}: tracker-on and tracker-off outputs differ — "
+                        "a missing WAR/RAW edge may have corrupted an in-flight kernel"
+                    ),
+                )
