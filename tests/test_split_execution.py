@@ -266,6 +266,20 @@ def _child_back_to_back(
     )
 
 
+def _child_wrapper(
+    env_overrides: dict,
+    target,
+    args: tuple,
+    result_queue: multiprocessing.Queue,
+) -> None:
+    """Apply env overrides BEFORE any import, then call target."""
+    # Must happen before torch_spyre is imported: startRuntime() reads env vars
+    # once via std::call_once, so they must be set before the first device op.
+    for k, v in env_overrides.items():
+        os.environ[k] = v
+    target(*args, result_queue)
+
+
 def _run_in_child(
     target,
     args: tuple,
@@ -273,15 +287,19 @@ def _run_in_child(
     cache_dir: pathlib.Path,
     timeout: float = 120.0,
 ) -> dict:
-    """Spawn a child process with the given env overrides, return its queue result."""
-    env = os.environ.copy()
-    env["SPYRE_COMPILE_CACHE_DIR"] = str(cache_dir)
-    env["SPYRE_NUM_CPUS"] = "1"  # deterministic single-program compile
-    env.update(env_overrides)
+    """Spawn a child process, apply env overrides before any import, return result."""
+    # Build the full env dict for reference but we can't pass it to Process directly
+    # (multiprocessing.Process has no env= param). Instead we pass overrides as
+    # an argument to _child_wrapper, which sets them before any torch import.
+    all_overrides = {
+        "SPYRE_COMPILE_CACHE_DIR": str(cache_dir),
+        "SPYRE_NUM_CPUS": "1",
+    }
+    all_overrides.update(env_overrides)
 
     ctx = multiprocessing.get_context("spawn")
     q: multiprocessing.Queue = ctx.Queue()
-    p = ctx.Process(target=target, args=(*args, q))
+    p = ctx.Process(target=_child_wrapper, args=(all_overrides, target, args, q))
     p.start()
     p.join(timeout=timeout)
     if p.is_alive():
