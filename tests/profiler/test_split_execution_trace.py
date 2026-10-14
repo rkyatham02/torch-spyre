@@ -16,6 +16,8 @@
 
 import json
 import math
+import os
+import warnings
 
 import pytest
 import torch
@@ -23,6 +25,26 @@ import torch._dynamo
 import torch_spyre  # noqa: F401  # registers the backend
 from torch.profiler import ProfilerActivity, profile
 from torch.testing._internal.common_utils import TemporaryFileName
+
+# ---------------------------------------------------------------------------
+# Clock-calibration env vars — must be set before the flex runtime starts.
+# If missing, the first profiler session triggers a calibration that stalls
+# DMA for tens of milliseconds inside the profiled window, corrupting timing.
+# We set them here as a fallback so the tests are self-contained when run
+# manually without the full CI env; a warning is emitted so it is visible.
+# ---------------------------------------------------------------------------
+_CALIBRATION_VARS = {
+    "FLEX_TIMESTAMP_CALIBRATION": "always",
+    "FLEX_SKIP_TIMESTAMP_CALIBRATION": "0",
+}
+for _var, _val in _CALIBRATION_VARS.items():
+    if os.environ.get(_var) != _val:
+        warnings.warn(
+            f"{_var} not set to '{_val}' — setting it now.  "
+            f"For CI, set this on the runner so it takes effect before flex starts.",
+            stacklevel=1,
+        )
+        os.environ[_var] = _val
 
 # ---------------------------------------------------------------------------
 # Workload constants — must be device-bound so kernel duration >> HC duration.
