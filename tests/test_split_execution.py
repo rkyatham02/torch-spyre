@@ -108,6 +108,7 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
     import tempfile
 
     import torch
+
     from torch_spyre import _C
 
     # Initialize the runtime (opens the device) and latch the tracker flag.
@@ -187,6 +188,7 @@ def _child_single_launch_correctness(tracker_on: bool) -> dict:
     """
     import torch
     import torch._dynamo
+
     import torch_spyre  # noqa: F401  # registers the backend
 
     torch._dynamo.reset()
@@ -224,6 +226,7 @@ def _child_back_to_back(
     """
     import torch
     import torch._dynamo
+
     import torch_spyre  # noqa: F401  # registers the backend
 
     torch._dynamo.reset()
