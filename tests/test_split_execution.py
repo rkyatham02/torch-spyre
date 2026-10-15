@@ -14,44 +14,9 @@
 
 """Split-execution parity and routing tests (issue #2889, PR #4419).
 
-No profiler is used here.  Every test runs on a Spyre device and belongs in
-the regression + integration + trunk CI suites.
-
-HOW TO RUN JUST ONE SECTION AT A TIME
---------------------------------------
-  # Section 1 — S_prep routing (device required):
-  pytest tests/test_split_execution.py::TestSPrepRouting -v
-
-  # Section 2 — single-launch correctness (device required):
-  pytest tests/test_split_execution.py::TestSingleLaunchCorrectness -v
-
-  # Section 3 — back-to-back launches, parity across tracker modes (device required):
-  pytest tests/test_split_execution.py::TestBackToBackParity -v
-
-  # All sections at once:
-  pytest tests/test_split_execution.py -v
-
-HOW EACH SECTION RELATES TO THE CRITERIA FROM #2889
------------------------------------------------------
-C3 — plan shape / roles: covered by test_prepare_kernel.py::TestPrepareKernel
-C3 — single-launch routing:   TestSPrepRouting
-C5 — fallback (tracker off):  TestSPrepRouting.test_s_prep_has_no_queued_work_tracker_off
-C1a — host ran ahead of device inside one launch:  TestSingleLaunchCorrectness
-C4 — same program in both modes (identical spyreCodeDir):  TestBackToBackParity
-
-DESIGN
-------
-* The parent pytest process never opens the device.  Each test that needs the
-  device launches a fresh child process via multiprocessing.  A shared
-  compile-cache directory (SPYRE_NUM_CPUS=1 to avoid non-determinism) is
-  created once per session and reused by all children.
-* The tracker-on child launches in a shifted order (pair (k+1) % n) so that
-  address collisions between runs are detectable.
-* No pytest.skip anywhere in this file.
-* Plan-shape assertions (HostCompute→Prep, Compute→Dev) live in
-  test_prepare_kernel.py::TestPrepareKernel::test_prepare_emits_bare_split_triple
-  and test_split_triple_roles — they call prepare_kernel with mock SpyreCode
-  inside a process that already has the runtime open, which is the right place.
+Every test runs on a Spyre device in a child process; the parent pytest
+process never opens the device.  Plan-shape assertions live in
+test_prepare_kernel.py::TestPrepareKernel.
 """
 
 import multiprocessing
@@ -61,48 +26,21 @@ import traceback
 import pytest
 import torch
 
-# ---------------------------------------------------------------------------
-# Shared compile-cache fixture
-# ---------------------------------------------------------------------------
-# SPYRE_COMPILE_CACHE_DIR is set on the os.environ of every child process so
-# all children share one compiled kernel.  SPYRE_NUM_CPUS=1 pins the compiler
-# to a single thread so the build is deterministic (no second program).
-
 
 @pytest.fixture(scope="session")
 def shared_compile_cache(tmp_path_factory) -> pathlib.Path:
     """One compile-cache directory reused by every child in this session."""
-    cache_dir = tmp_path_factory.mktemp("spyre_compile_cache", numbered=False)
-    return cache_dir
+    return tmp_path_factory.mktemp("spyre_compile_cache", numbered=False)
 
 
-# ---------------------------------------------------------------------------
-# Child-process helpers
-# ---------------------------------------------------------------------------
-# Each _child_* function runs inside multiprocessing.Process.  It must NOT
-# import torch or torch_spyre at module level in the parent — those are only
-# imported inside the child so the parent never opens the device.
-
-_MM_M, _MM_K, _MM_N = 1024, 8192, 1024  # device-bound shape (kernel ~800 µs)
+_MM_M, _MM_K, _MM_N = 1024, 8192, 1024
 _MM_DTYPE = torch.float16
-# Smaller shape for correctness tests — fast compile (~seconds), still exercises
-# the full HostCompute + Compute path with a real correction.
+# Smaller shape for fast compile in correctness tests.
 _COR_M, _COR_K, _COR_N = 64, 512, 64
 
 
 def _child_s_prep_routing(tracker_on: bool) -> dict:
-    """Child: verify the hazard-tracker flag and the JobPlan routing contract.
-
-    What we check (C3/C5):
-    - get_hazard_tracker_enabled() matches what SPYRE_HAZARD_TRACKER was set to.
-      This is the exact flag SpyreStream::launch reads as `should_split`.
-    - A ComputeOnHost JobPlan has HostCompute(Prep) + Compute(Dev).
-      With should_split=True both conditions are met → HostCompute → s_prep.
-      With should_split=False routing ignores roles → HostCompute → s_dev.
-
-    Plan-shape assertions use mock SpyreCode (same as test_prepare_kernel.py)
-    so this child doesn't depend on a live compile artifact path.
-    """
+    """Child: check the hazard-tracker flag and the JobPlan step roles."""
     import json
     import os
     import tempfile
@@ -111,14 +49,12 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
 
     from torch_spyre import _C
 
-    # Initialize the runtime (opens the device) and latch the tracker flag.
+    # Opens the device and latches the tracker flag.
     torch.zeros(1, device="spyre")
 
-    # 1. Confirm the tracker flag was read correctly from the environment.
     tracker_enabled = _C.get_hazard_tracker_enabled()
 
-    # 2. Build a mock ComputeOnHost JobPlan and check its step roles.
-    #    This is the same plan shape the real mm compiler emits.
+    # Mock ComputeOnHost plan, same shape the real mm compiler emits.
     with tempfile.TemporaryDirectory() as tmpdir:
         spyrecode_dir = f"{tmpdir}/spyreCodeDir"
         os.makedirs(spyrecode_dir)
@@ -180,12 +116,7 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
 
 
 def _child_single_launch_correctness(tracker_on: bool) -> dict:
-    """Child: compile + run mm once, return results as plain lists (not tensors).
-
-    Tensors cannot safely cross the process boundary after the child exits — torch uses a
-    shared-memory socket that is torn down on exit.  We convert to Python lists
-    before returning so the parent receives plain serialisable data.
-    """
+    """Child: compile and run mm once; results returned as plain lists."""
     import torch
     import torch._dynamo
 
@@ -193,7 +124,6 @@ def _child_single_launch_correctness(tracker_on: bool) -> dict:
 
     torch._dynamo.reset()
     torch.manual_seed(0)
-    # Use the smaller correctness shape — compiles in seconds, not minutes.
     a_cpu = torch.randn(_COR_M, _COR_K, dtype=_MM_DTYPE)
     b_cpu = torch.randn(_COR_K, _COR_N, dtype=_MM_DTYPE)
     ref = torch.mm(a_cpu.float(), b_cpu.float())
@@ -204,7 +134,6 @@ def _child_single_launch_correctness(tracker_on: bool) -> dict:
     out = compiled(a, b).cpu()
 
     torch.accelerator.synchronize()
-    # Serialize as nested lists — safe across process boundary after child exits.
     return {
         "out": out.float().tolist(),
         "ref": ref.float().tolist(),
@@ -218,12 +147,7 @@ def _child_back_to_back(
     num_launches: int,
     shift: int,
 ) -> dict:
-    """Child: run mm num_launches times, return outputs as lists (not tensors).
-
-    Uses the smaller correctness shape so the compile fits in the timeout.
-    tracker-on child uses pair (k + shift) % n to vary addresses vs tracker-off.
-    Outputs serialized as nested float lists — safe after child exits.
-    """
+    """Child: run mm num_launches times in order (k + shift) % n; return lists."""
     import os
 
     import torch
@@ -235,7 +159,6 @@ def _child_back_to_back(
     torch.manual_seed(1)
     device = torch.device("spyre")
 
-    # Use the smaller correctness shape.
     pairs_cpu: list[tuple[torch.Tensor, torch.Tensor]] = [
         (
             torch.randn(_COR_M, _COR_K, dtype=_MM_DTYPE),
@@ -246,11 +169,8 @@ def _child_back_to_back(
     pairs_spyre = [(a.to(device), b.to(device)) for a, b in pairs_cpu]
 
     compiled = torch.compile(torch.mm, backend="inductor")
-    # warm-up with pair 0
     compiled(pairs_spyre[0][0], pairs_spyre[0][1])
 
-    # outputs_by_pair[pair_idx] = output list, so both children can be compared
-    # at the same logical pair regardless of launch order.
     outputs_by_pair: dict[int, list] = {}
     refs_by_pair: dict[int, list] = {}
     for k in range(num_launches):
@@ -264,12 +184,9 @@ def _child_back_to_back(
 
     torch.accelerator.synchronize(device)
 
-    # Also expose slot-order lists for the per-slot CPU-parity tests.
     outputs = [outputs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
     refs = [refs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
 
-    # Expose the compile-cache directory so the parent can assert both tracker
-    # modes compiled and ran the same program (C4: identical spyreCodeDir).
     spyre_code_dir = os.environ.get("SPYRE_COMPILE_CACHE_DIR", "")
 
     return {
@@ -287,12 +204,11 @@ def _child_wrapper(
     args: tuple,
     conn,
 ) -> None:
-    """Apply env overrides BEFORE any import, then call target."""
+    """Apply env overrides, then call target and send back the result."""
     import os
 
     try:
-        # Must happen before torch_spyre is imported: startRuntime() reads env vars
-        # once via std::call_once, so they must be set before the first device op.
+        # Runtime reads env vars once at startup, so set them before any device op.
         for k, v in env_overrides.items():
             os.environ[k] = v
         result = target(*args)
@@ -310,10 +226,7 @@ def _run_in_child(
     cache_dir: pathlib.Path,
     timeout: float = 120.0,
 ) -> dict:
-    """Spawn a child process, apply env overrides before any import, return result."""
-    # Build the full env dict for reference but we can't pass it to Process directly
-    # (multiprocessing.Process has no env= param). Instead we pass overrides as
-    # an argument to _child_wrapper, which sets them before any torch import.
+    """Spawn a child process with env overrides applied and return its result."""
     all_overrides = {
         "SPYRE_COMPILE_CACHE_DIR": str(cache_dir),
         "SPYRE_NUM_CPUS": "1",
@@ -365,32 +278,11 @@ def _tracker_off_env() -> dict:
     return {"SPYRE_HAZARD_TRACKER": "0"}
 
 
-# ---------------------------------------------------------------------------
-# Section 1 — S_prep routing (C3/C5: tracker on queues work to S_prep; off does not)
-# ---------------------------------------------------------------------------
-
-
 class TestSPrepRouting:
-    """C3/C5: tracker flag is read, plan has Prep role, routing contract holds."""
+    """Tracker flag is read and the plan has the expected step roles."""
 
     def test_tracker_on_enables_split_routing(self, shared_compile_cache):
-        """Tracker on: get_hazard_tracker_enabled()==True and plan has Prep role.
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestSPrepRouting::test_tracker_on_enables_split_routing -v
-
-        What this proves (C3):
-        - SPYRE_HAZARD_TRACKER=1 was read at startup: get_hazard_tracker_enabled()
-          returns True.
-        - The compiled mm's JobPlan has a HostCompute step with role "Prep".
-        - SpyreStream::launch checks should_split = get_hazard_tracker_enabled(),
-          so with both True the HostCompute step is routed to s_prep and the
-          Compute step to s_dev — the split is live.
-
-        Note: stream.query() reflects the torch event queue, not the underlying
-        flex DMA queue.  HostCompute's H2D goes directly to a flex stream and is
-        invisible to torch, so query() is not a useful routing signal here.
-        """
+        """Tracker on: flag is True and the plan has HostCompute(Prep) + Compute(Dev)."""
         result = _run_in_child(
             _child_s_prep_routing,
             args=(True,),
@@ -417,16 +309,7 @@ class TestSPrepRouting:
         )
 
     def test_tracker_off_disables_split_routing(self, shared_compile_cache):
-        """Tracker off (C5): get_hazard_tracker_enabled()==False, all steps to S_dev.
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestSPrepRouting::test_tracker_off_disables_split_routing -v
-
-        With SPYRE_HAZARD_TRACKER=0, should_split=False in SpyreStream::launch
-        so every step — including HostCompute — is routed to S_dev.  The plan
-        shape is unchanged (roles are baked in at prepare_kernel time), but
-        routing ignores them.
-        """
+        """Tracker off: flag is False; the plan shape is unchanged."""
         result = _run_in_child(
             _child_s_prep_routing,
             args=(False,),
@@ -437,35 +320,20 @@ class TestSPrepRouting:
             "SPYRE_HAZARD_TRACKER=0 was set but get_hazard_tracker_enabled() "
             "returned True — the env var was not read correctly."
         )
-        # Plan still has HostCompute(Prep) — prepare_kernel is tracker-agnostic.
-        # The routing flag being False is sufficient to prove the fallback path.
         assert "HostCompute" in result["step_types"], (
             "Even with tracker off the mm plan must still contain HostCompute "
             f"(plan shape is tracker-agnostic). Got: {result['step_types']}"
         )
 
 
-# ---------------------------------------------------------------------------
-# Section 3 — Single-launch correctness (C3: right answer in both modes)
-# ---------------------------------------------------------------------------
-
-
 class TestSingleLaunchCorrectness:
-    """C3: one mm launch produces the correct result in both tracker modes."""
+    """One mm launch produces the correct result in both tracker modes."""
 
     @pytest.mark.parametrize(
         "tracker_on", [True, False], ids=["tracker_on", "tracker_off"]
     )
     def test_single_mm_matches_cpu(self, tracker_on, shared_compile_cache):
-        """mm output matches CPU reference in both tracker modes.
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestSingleLaunchCorrectness -v
-
-        Tolerances come from empirical measurements (2.5e-3 to 3.7e-3 relative
-        Frobenius).  atol=0.01 is tight enough to catch an all-zero output but
-        loose enough for fp16 accumulation error.
-        """
+        """mm output matches CPU reference in both tracker modes."""
         env = _tracker_on_env() if tracker_on else _tracker_off_env()
         result = _run_in_child(
             _child_single_launch_correctness,
@@ -486,31 +354,21 @@ class TestSingleLaunchCorrectness:
         )
 
 
-# ---------------------------------------------------------------------------
-# Section 4 — Back-to-back parity (C4: same program, same results across modes)
-# ---------------------------------------------------------------------------
-
-_NUM_BACK_TO_BACK = 4  # number of sequential launches per child
+_NUM_BACK_TO_BACK = 4
 
 
 class TestBackToBackParity:
-    """C4: back-to-back launches give the right answers and use the same kernel.
+    """Back-to-back launches give correct answers and use the same kernel.
 
-    The tracker-on child launches input pairs in a shifted order so its tensor
-    addresses differ from the tracker-off child.  If the split has a WAR/RAW
-    edge missing, a later correction H2D would land at the wrong address and
-    corrupt an in-flight kernel — producing a numeric mismatch vs. CPU.
+    The tracker-on child launches pairs in a shifted order so its tensor
+    addresses differ from the tracker-off child.
     """
 
     def test_back_to_back_tracker_on_matches_cpu(self, shared_compile_cache):
-        """tracker on: every back-to-back output matches its CPU reference.
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestBackToBackParity::test_back_to_back_tracker_on_matches_cpu -v
-        """
+        """tracker on: every back-to-back output matches its CPU reference."""
         result = _run_in_child(
             _child_back_to_back,
-            args=(True, _NUM_BACK_TO_BACK, 1),  # shift=1 → different address order
+            args=(True, _NUM_BACK_TO_BACK, 1),
             env_overrides=_tracker_on_env(),
             cache_dir=shared_compile_cache,
         )
@@ -534,14 +392,10 @@ class TestBackToBackParity:
             )
 
     def test_back_to_back_tracker_off_matches_cpu(self, shared_compile_cache):
-        """tracker off: every back-to-back output matches its CPU reference.
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestBackToBackParity::test_back_to_back_tracker_off_matches_cpu -v
-        """
+        """tracker off: every back-to-back output matches its CPU reference."""
         result = _run_in_child(
             _child_back_to_back,
-            args=(False, _NUM_BACK_TO_BACK, 0),  # shift=0 → natural order
+            args=(False, _NUM_BACK_TO_BACK, 0),
             env_overrides=_tracker_off_env(),
             cache_dir=shared_compile_cache,
         )
@@ -565,41 +419,20 @@ class TestBackToBackParity:
             )
 
     def test_tracker_on_off_outputs_are_identical(self, shared_compile_cache):
-        """tracker on and off produce bit-identical outputs for every pair (C4).
-
-        HOW TO TEST:
-          pytest tests/test_split_execution.py::TestBackToBackParity::test_tracker_on_off_outputs_are_identical -v
-
-        What this proves (C4 / correctness under overlap):
-        - The tracker-on child uses a shifted launch order (shift=1) so its
-          tensor addresses differ from the tracker-off child.  If a WAR or RAW
-          edge is missing, the correction H2D for one launch can corrupt the
-          in-flight kernel of another, producing a different result.
-        - Outputs are keyed by pair index (outputs_by_pair) so the comparison
-          is always between the same logical input pair regardless of which slot
-          each child computed it in.
-        - Both children run the same compiled kernel (shared compile cache),
-          so any numeric difference is a routing / ordering bug, not a compile
-          difference.
-
-        The plan also notes that tracker-on and tracker-off outputs were
-        bit-identical in all 16 empirical traces; this test encodes that
-        guarantee.
-        """
+        """tracker on and off produce identical outputs for every input pair."""
         result_on = _run_in_child(
             _child_back_to_back,
-            args=(True, _NUM_BACK_TO_BACK, 1),  # shift=1 → varied addresses
+            args=(True, _NUM_BACK_TO_BACK, 1),
             env_overrides=_tracker_on_env(),
             cache_dir=shared_compile_cache,
         )
         result_off = _run_in_child(
             _child_back_to_back,
-            args=(False, _NUM_BACK_TO_BACK, 0),  # shift=0 → natural order
+            args=(False, _NUM_BACK_TO_BACK, 0),
             env_overrides=_tracker_off_env(),
             cache_dir=shared_compile_cache,
         )
 
-        # Both children must have used the same compiled program (C4).
         assert result_on["spyre_code_dir"] == result_off["spyre_code_dir"], (
             f"tracker-on and tracker-off children used different compile caches: "
             f"on={result_on['spyre_code_dir']!r} off={result_off['spyre_code_dir']!r}"
@@ -612,7 +445,6 @@ class TestBackToBackParity:
         on_by_pair: dict = result_on["outputs_by_pair"]
         off_by_pair: dict = result_off["outputs_by_pair"]
 
-        # Both children must have computed the same set of pair indices.
         assert set(on_by_pair.keys()) == set(off_by_pair.keys()), (
             f"Pair index mismatch between children: "
             f"on={sorted(on_by_pair.keys())} off={sorted(off_by_pair.keys())}"
@@ -621,8 +453,6 @@ class TestBackToBackParity:
         for pair_idx in sorted(on_by_pair.keys()):
             out_on = torch.tensor(on_by_pair[pair_idx])
             out_off = torch.tensor(off_by_pair[pair_idx])
-            # Empirically bit-identical; use exact equality first, fall back to
-            # a tight tolerance only if the fp32 round-trip introduces noise.
             if not torch.equal(out_on, out_off):
                 torch.testing.assert_close(
                     out_on,

@@ -25,19 +25,10 @@ from torch.testing._internal.common_utils import TemporaryFileName
 
 import torch_spyre  # noqa: F401  # registers the backend
 
-# ---------------------------------------------------------------------------
-# Workload constants — must be device-bound so kernel duration >> HC duration.
-# Use a shape large enough that the kernel outlasts the host compute work,
-# allowing HC[k+1] to complete while kernel[k] is still running on the device.
-# ---------------------------------------------------------------------------
+# Device-bound shape so kernel duration >> host compute duration.
 _MM_M, _MM_K, _MM_N = 2048, 8192, 2048
 _MM_DTYPE = torch.float16
-_NUM_LAUNCHES = 4  # back-to-back launches profiled per test
-
-
-# ---------------------------------------------------------------------------
-# Helpers — trace parsing
-# ---------------------------------------------------------------------------
+_NUM_LAUNCHES = 4
 
 
 def _complete_events(trace_events: list[dict]) -> list[dict]:
@@ -57,21 +48,15 @@ def _complete_events(trace_events: list[dict]) -> list[dict]:
 
 
 def _kernel_events(events: list[dict]) -> list[dict]:
-    """Return device compute events (cat=='kernel')."""
     return [e for e in events if e.get("cat") == "kernel"]
 
 
 def _memcpy_events(events: list[dict]) -> list[dict]:
-    """Return device DMA events (cat=='gpu_memcpy')."""
     return [e for e in events if e.get("cat") == "gpu_memcpy"]
 
 
 def _host_compute_spans(events: list[dict]) -> list[dict]:
-    """Return CPU-side launch::HostCompute spans.
-
-    flex names the span exactly 'launch::HostCompute'; it appears as a CPU
-    event (cat=='cpu_op' or similar) not a device event.
-    """
+    """Return CPU-side launch::HostCompute spans."""
     return [
         e
         for e in events
@@ -80,14 +65,7 @@ def _host_compute_spans(events: list[dict]) -> list[dict]:
 
 
 def _skew_us(events: list[dict]) -> float:
-    """Estimate host-to-device clock skew in µs from correlated event pairs.
-
-    Uses aiuLaunchControlBlocks (CPU) ↔ kernel (device) correlation pairs.
-    For each pair, skew = kernel.ts - cpu_launch.ts - min_dispatch_overhead.
-    We take the median over all pairs as the best estimate.
-
-    Returns 0.0 if no correlated pairs are found (skew correction is skipped).
-    """
+    """Median host-to-device clock skew in µs; 0.0 if no correlated pairs."""
     cpu_by_corr: dict[int, dict] = {}
     kernel_list: list[dict] = []
 
@@ -120,11 +98,7 @@ def _skew_us(events: list[dict]) -> float:
 
 
 def _apply_skew(events: list[dict], skew_us: float) -> list[dict]:
-    """Return a copy of events with device-clock ts values shifted by -skew_us.
-
-    Only shifts kernel and gpu_memcpy events (device clock); leaves CPU events
-    untouched.  Returns a shallow-copied list; individual dicts are copied too.
-    """
+    """Return a copy of events with device-clock ts values shifted by -skew_us."""
     device_cats = {"kernel", "gpu_memcpy"}
     result = []
     for ev in events:
@@ -135,35 +109,20 @@ def _apply_skew(events: list[dict], skew_us: float) -> list[dict]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Helpers — overlap / ordering geometry
-# ---------------------------------------------------------------------------
-
-
 def _starts_inside(inner: dict, outer: dict) -> bool:
-    """True if inner starts within outer's time range."""
     return outer["ts"] <= inner["ts"] < outer["ts"] + outer.get("dur", 0)
 
 
 def _ends_before(a: dict, b: dict) -> bool:
-    """True if a ends before b ends (a.ts + a.dur < b.ts + b.dur)."""
     return (a["ts"] + a.get("dur", 0)) < (b["ts"] + b.get("dur", 0))
-
-
-# ---------------------------------------------------------------------------
-# Fixture — compile once per session, warm up outside profiled region
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def compiled_mm():
-    """Compile mm and warm up once; return the compiled callable.
+    """Compile mm and warm up once; opens the device in the pytest process.
 
-    Note: this fixture intentionally opens the device in the parent pytest
-    process.  Unlike test_split_execution.py (which isolates every device
-    operation in a child process), the trace tests must run the profiler in
-    the same process as the device — torch.profiler cannot span a
-    multiprocessing.Process boundary.
+    The profiler cannot span a process boundary, so unlike
+    test_split_execution.py this cannot use a child process.
     """
     torch._dynamo.reset()
     torch.manual_seed(0)
@@ -178,25 +137,13 @@ def compiled_mm():
     return fn
 
 
-# ---------------------------------------------------------------------------
-# Helper — run N back-to-back launches under the profiler, export trace
-# ---------------------------------------------------------------------------
-
-
 def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> dict:
-    """Run num_launches back-to-back mm calls under torch.profiler.
+    """Run num_launches mm calls under the profiler.
 
-    tracker_on only affects the random seed (and therefore tensor addresses);
-    the actual tracker mode is fixed at runtime startup via SPYRE_HAZARD_TRACKER
-    and cannot be changed between calls.  All trace tests run with tracker on;
-    the tracker_on=False path in test_host_compute_timing_diagnostic is for
-    diagnostic seed variation only.
+    tracker_on only selects the random seed; the tracker mode itself is fixed
+    at runtime startup via SPYRE_HAZARD_TRACKER.
 
-    Returns a dict with:
-      - "events": list of complete trace events (clock-skew corrected)
-      - "outputs": list of mm output tensors (on CPU, float32)
-      - "refs":    list of CPU float32 reference tensors
-      - "skew_us": the applied clock skew correction in µs
+    Returns "events" (skew-corrected), "outputs", "refs", and "skew_us".
     """
     device = torch.device("spyre")
     torch.manual_seed(3 if tracker_on else 7)
@@ -208,10 +155,7 @@ def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> d
         )
         for _ in range(num_launches)
     ]
-    # Upload tensors before the profiled window so tensor-transfer H2Ds do not
-    # appear in the trace alongside correction H2Ds.  The WAR/RAW edge checks
-    # key on correction H2Ds only; mixing in input-tensor transfers would make
-    # index-aligned pairing unreliable.
+    # Upload before profiling so only correction H2Ds appear in the trace.
     pairs_spyre = [(a.to(device), b.to(device)) for a, b in pairs_cpu]
     torch.accelerator.synchronize(device)
 
@@ -243,18 +187,11 @@ def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> d
     }
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.requires_spyre_profiler
 class TestSplitExecutionTrace:
     """Trace-level checks for split-execution correctness (issue #2889).
 
-    All tests in this class require SPYRE_HAZARD_TRACKER=1.  The tracker mode
-    is latched once at runtime startup (std::call_once); it cannot be toggled
-    between tests.  Set it before launching pytest:
+    Requires SPYRE_HAZARD_TRACKER=1, which is latched at runtime startup:
         SPYRE_HAZARD_TRACKER=1 USE_SPYRE_PROFILER=1 pytest ...
     """
 
@@ -268,12 +205,7 @@ class TestSplitExecutionTrace:
             )
 
     def test_host_compute_span_present(self, compiled_mm):
-        """launch::HostCompute CPU span appears in the trace with tracker on.
-
-        This is the #3488 sentinel: if the span disappears after the host
-        computation is moved off the calling thread, this test fails clearly
-        rather than letting test_host_ran_ahead pass vacuously on an empty set.
-        """
+        """launch::HostCompute CPU span appears in the trace with tracker on."""
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
         hc_spans = _host_compute_spans(result["events"])
         assert hc_spans, (
@@ -283,25 +215,7 @@ class TestSplitExecutionTrace:
         )
 
     def test_host_compute_timing_diagnostic(self, compiled_mm):
-        """Diagnostic: report HC-vs-kernel timing for both tracker modes (never fails).
-
-        Overlap between host compute and device kernels is timing-dependent and
-        varies across hardware, runs, and scheduler state.  This test always
-        passes and prints per-pair timing so the reviewer can assess whether
-        overlap occurred on the hardware under test.
-
-        To harden into an assertion, run 10 times serially, confirm
-        partly_inside >= 1 on every run, then replace this test with assertions.
-        See plan section "Validate on a device" for the methodology.
-
-        Per-pair columns:
-          kernel_dur      — device kernel duration
-          hc_dur          — launch::HostCompute CPU span duration
-          hc_end→k_start  — gap from HC[k+1] end to kernel[k] start;
-                            negative = HC ended after kernel started
-          hc_start_inside — HC[k+1] started while kernel[k] was running
-          hc_ends_before  — HC[k+1] ended before kernel[k] ended (ran ahead)
-        """
+        """Diagnostic: print HC-vs-kernel timing per pair; never fails."""
         result_on = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
         result_off = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=False)
 
@@ -337,15 +251,9 @@ class TestSplitExecutionTrace:
 
         _print_timing(result_on, "tracker-on")
         _print_timing(result_off, "tracker-off")
-        # Always passes — overlap is hardware/run-dependent.
 
     def test_raw_edge_kernel_after_h2d(self, compiled_mm):
-        """RAW edge: kernel k starts after its own correction H2D ends.
-
-        flex inserts this edge dynamically when the tracker is on.  A missing
-        RAW edge would let the kernel start before the correction is written,
-        corrupting the result.
-        """
+        """RAW edge: kernel k starts after its own correction H2D ends."""
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
 
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
@@ -354,10 +262,7 @@ class TestSplitExecutionTrace:
         assert kernels, "No kernel events — check AIUPTI."
         assert memcpys, "No memcpy (H2D) events — check AIUPTI."
 
-        # Index-aligned pairing: h2ds[k] is the correction H2D for kernel[k].
-        # Tensor-upload H2Ds are excluded from the profiled window (uploads
-        # happen before the profile() context), so the only H2Ds in the trace
-        # are correction transfers — one per launch, in launch order.
+        # One correction H2D per launch, so h2ds[k] pairs with kernels[k].
         h2ds = sorted(
             [m for m in memcpys if "HtoD" in m.get("name", "")],
             key=lambda e: e["ts"],
@@ -383,12 +288,7 @@ class TestSplitExecutionTrace:
         )
 
     def test_war_edge_h2d_after_preceding_kernel(self, compiled_mm):
-        """WAR edge: correction H2D k+1 starts after kernel k ends.
-
-        flex inserts this edge so that a new correction write cannot overwrite
-        the device slot while the preceding kernel is still reading it.
-        A missing WAR edge is the primary failure mode for back-to-back launches.
-        """
+        """WAR edge: correction H2D k+1 starts after kernel k ends."""
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
 
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
@@ -405,8 +305,6 @@ class TestSplitExecutionTrace:
         assert len(h2ds) >= 2, "Need ≥ 2 H2D events to check WAR edge."
 
         violations = []
-        # For adjacent kernel[k] / h2d[k+1] pairs: h2d[k+1] must start after
-        # kernel[k] ends.
         num_pairs = min(len(kernels), len(h2ds)) - 1
         for k in range(num_pairs):
             kernel_k_end = kernels[k]["ts"] + kernels[k].get("dur", 0)
@@ -426,11 +324,7 @@ class TestSplitExecutionTrace:
         )
 
     def test_profiled_outputs_match_cpu(self, compiled_mm):
-        """Outputs collected inside the profiled region match the CPU reference.
-
-        Guards that the profiling session itself does not corrupt results
-        (e.g. via calibration DMA stall or event-buffer interference).
-        """
+        """Outputs collected inside the profiled region match the CPU reference."""
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
 
         for k, (out, ref) in enumerate(zip(result["outputs"], result["refs"])):
@@ -441,15 +335,11 @@ class TestSplitExecutionTrace:
             )
 
     def test_reprofiled_window_after_calibration(self, compiled_mm):
-        """A second profiling session after the first produces valid device events.
+        """A second profiling session still produces valid device events.
 
-        Opening the first profiler session triggers a clock calibration that
-        stalled DMA for 14–43 ms in empirical measurements (flex pre-#1930).
-        Setting FLEX_TIMESTAMP_CALIBRATION=always (and FLEX_SKIP_TIMESTAMP_CALIBRATION=0)
-        moves calibration to runtime start so the stall is outside both sessions.
-        This test guards that: the second session (the "re-profiled window") still
-        yields kernel events with non-zero, finite timestamps — i.e. the stall
-        did not permanently break the device clock or AIUPTI buffer.
+        Requires FLEX_TIMESTAMP_CALIBRATION=always and
+        FLEX_SKIP_TIMESTAMP_CALIBRATION=0 so the calibration stall happens at
+        runtime start, outside both sessions.
         """
         device = torch.device("spyre")
         torch.manual_seed(5)
@@ -457,7 +347,6 @@ class TestSplitExecutionTrace:
         a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
         b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
 
-        # First session — may incur calibration stall if env vars are not set.
         with TemporaryFileName(mode="w+") as _:
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
@@ -466,7 +355,6 @@ class TestSplitExecutionTrace:
                 torch.accelerator.synchronize(device)
             prof1.export_chrome_trace(_)
 
-        # Second session — the re-profiled window. Must still have valid events.
         a2 = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
         b2 = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
 
