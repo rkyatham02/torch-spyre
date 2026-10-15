@@ -191,14 +191,7 @@ def _child_back_to_back(
     num_launches: int,
     shift: int,
 ) -> dict:
-    """Child: run mm num_launches times in order (k + shift) % n; return lists.
-
-    Also returns ``output_addrs_by_pair``: the device address of each output
-    tensor keyed by pair index.  The parent uses this to detect address clashes
-    between the tracker-on and tracker-off children — a clash would mean a
-    "correct" result could be a stale value left by the other child rather than
-    a freshly computed one, which would let a missing WAR/RAW edge go undetected.
-    """
+    """Child: run mm num_launches times in order (k + shift) % n; return lists."""
     import torch
     import torch._dynamo
 
@@ -228,10 +221,6 @@ def _child_back_to_back(
         a_s, b_s = pairs_spyre[idx]
         a_c, b_c = pairs_cpu[idx]
         out_spyre = compiled(a_s, b_s)
-        # Record the device address before pulling the result to the host.
-        # tensor.data_ptr() returns the raw device pointer so we can compare
-        # address sets across children without keeping device tensors alive in
-        # the parent process.
         output_addrs_by_pair[idx] = out_spyre.data_ptr()
         out = out_spyre.cpu().float().tolist()
         ref = torch.mm(a_c.float(), b_c.float()).float().tolist()
@@ -514,21 +503,10 @@ class TestBackToBackParity:
     def test_no_pair_lands_where_tracker_off_left_its_result(
         self, shared_compile_cache
     ):
-        """tracker-on output addresses don't overlap tracker-off output addresses.
+        """Output addresses are disjoint across tracker modes.
 
-        Device memory is not cleared on allocation, so if the tracker-on child
-        allocates an output tensor at the same address the tracker-off child
-        already wrote its (correct) result to, test_tracker_on_off_outputs_are_identical
-        could silently pass even with a missing WAR/RAW edge — a real corruption
-        would read back stale correct bytes rather than wrong values.
-
-        This test runs both children and asserts the sets of device addresses used
-        for outputs are disjoint, so any agreement in the cross-mode comparison is
-        a real freshly-computed match, not a stale-memory coincidence.
-
-        If this test fails with an address clash, do not merge: the correctness
-        comparison in test_tracker_on_off_outputs_are_identical is unreliable for
-        any pair whose address is in the intersection.
+        Device memory is not cleared on allocation.  If both children write to
+        the same address, a stale correct value could mask a missing WAR/RAW edge.
         """
         result_on = _run_in_child(
             _child_back_to_back,

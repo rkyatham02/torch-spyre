@@ -32,7 +32,7 @@ _NUM_LAUNCHES = 4
 
 
 def _complete_events(trace_events: list[dict]) -> list[dict]:
-    """Return only complete (ph=='X') events with a finite numeric ts."""
+    """Complete (ph=='X') events with finite ts."""
     out = []
     for ev in trace_events:
         if not isinstance(ev, dict) or ev.get("ph") != "X":
@@ -56,7 +56,7 @@ def _memcpy_events(events: list[dict]) -> list[dict]:
 
 
 def _host_compute_spans(events: list[dict]) -> list[dict]:
-    """Return CPU-side launch::HostCompute spans."""
+    """CPU-side launch::HostCompute spans."""
     return [
         e
         for e in events
@@ -65,7 +65,7 @@ def _host_compute_spans(events: list[dict]) -> list[dict]:
 
 
 def _skew_us(events: list[dict]) -> float:
-    """Median host-to-device clock skew in µs; 0.0 if no correlated pairs."""
+    """Median host-to-device clock skew in µs."""
     cpu_by_corr: dict[int, dict] = {}
     kernel_list: list[dict] = []
 
@@ -98,7 +98,7 @@ def _skew_us(events: list[dict]) -> float:
 
 
 def _apply_skew(events: list[dict], skew_us: float) -> list[dict]:
-    """Return a copy of events with device-clock ts values shifted by -skew_us."""
+    """Shift device-clock ts values by -skew_us."""
     device_cats = {"kernel", "gpu_memcpy"}
     result = []
     for ev in events:
@@ -191,6 +191,9 @@ class TestSplitExecutionTrace:
 
     Requires SPYRE_HAZARD_TRACKER=1, which is latched at runtime startup:
         SPYRE_HAZARD_TRACKER=1 USE_SPYRE_PROFILER=1 pytest ...
+
+    Set FLEX_TIMESTAMP_CALIBRATION=always and FLEX_SKIP_TIMESTAMP_CALIBRATION=0
+    to move clock calibration to runtime startup and avoid per-session DMA stalls.
     """
 
     @pytest.fixture(autouse=True)
