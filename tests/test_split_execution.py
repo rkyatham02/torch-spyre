@@ -19,6 +19,7 @@ process never opens the device.  Plan-shape assertions live in
 test_prepare_kernel.py::TestPrepareKernel.
 """
 
+import hashlib
 import multiprocessing
 import pathlib
 import traceback
@@ -148,8 +149,6 @@ def _child_back_to_back(
     shift: int,
 ) -> dict:
     """Child: run mm num_launches times in order (k + shift) % n; return lists."""
-    import os
-
     import torch
     import torch._dynamo
 
@@ -187,14 +186,11 @@ def _child_back_to_back(
     outputs = [outputs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
     refs = [refs_by_pair[(k + shift) % num_launches] for k in range(num_launches)]
 
-    spyre_code_dir = os.environ.get("SPYRE_COMPILE_CACHE_DIR", "")
-
     return {
         "tracker_on": tracker_on,
         "outputs": outputs,
         "refs": refs,
         "outputs_by_pair": outputs_by_pair,
-        "spyre_code_dir": spyre_code_dir,
     }
 
 
@@ -228,7 +224,7 @@ def _run_in_child(
 ) -> dict:
     """Spawn a child process with env overrides applied and return its result."""
     all_overrides = {
-        "SPYRE_COMPILE_CACHE_DIR": str(cache_dir),
+        "TORCHINDUCTOR_CACHE_DIR": str(cache_dir),
         "SPYRE_NUM_CPUS": "1",
     }
     all_overrides.update(env_overrides)
@@ -268,6 +264,14 @@ def _run_in_child(
         )
 
     return payload
+
+
+def _compiled_programs(cache_dir: pathlib.Path) -> set[str]:
+    """Return content hashes of every compiled spyrecode.json under cache_dir."""
+    return {
+        hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in cache_dir.rglob("spyreCodeDir/spyrecode.json")
+    }
 
 
 def _tracker_on_env() -> dict:
@@ -426,20 +430,21 @@ class TestBackToBackParity:
             env_overrides=_tracker_on_env(),
             cache_dir=shared_compile_cache,
         )
+        programs_on = _compiled_programs(shared_compile_cache)
         result_off = _run_in_child(
             _child_back_to_back,
             args=(False, _NUM_BACK_TO_BACK, 0),
             env_overrides=_tracker_off_env(),
             cache_dir=shared_compile_cache,
         )
+        programs_off = _compiled_programs(shared_compile_cache)
 
-        assert result_on["spyre_code_dir"] == result_off["spyre_code_dir"], (
-            f"tracker-on and tracker-off children used different compile caches: "
-            f"on={result_on['spyre_code_dir']!r} off={result_off['spyre_code_dir']!r}"
+        assert programs_on, (
+            f"No compiled spyrecode.json found under {shared_compile_cache}"
         )
-        assert result_on["spyre_code_dir"], (
-            "SPYRE_COMPILE_CACHE_DIR was not set in the child — "
-            "cannot verify both modes used the same program."
+        assert programs_off == programs_on, (
+            "tracker-off child compiled a different program than tracker-on: "
+            f"{len(programs_off - programs_on)} new spyrecode.json variant(s)"
         )
 
         on_by_pair: dict = result_on["outputs_by_pair"]

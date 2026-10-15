@@ -137,16 +137,13 @@ def compiled_mm():
     return fn
 
 
-def _profile_back_to_back(compiled_fn, num_launches: int, tracker_on: bool) -> dict:
+def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     """Run num_launches mm calls under the profiler.
-
-    tracker_on only selects the random seed; the tracker mode itself is fixed
-    at runtime startup via SPYRE_HAZARD_TRACKER.
 
     Returns "events" (skew-corrected), "outputs", "refs", and "skew_us".
     """
     device = torch.device("spyre")
-    torch.manual_seed(3 if tracker_on else 7)
+    torch.manual_seed(3)
 
     pairs_cpu = [
         (
@@ -206,7 +203,7 @@ class TestSplitExecutionTrace:
 
     def test_host_compute_span_present(self, compiled_mm):
         """launch::HostCompute CPU span appears in the trace with tracker on."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
         hc_spans = _host_compute_spans(result["events"])
         assert hc_spans, (
             "No launch::HostCompute CPU spans found in the trace with tracker on.  "
@@ -216,45 +213,37 @@ class TestSplitExecutionTrace:
 
     def test_host_compute_timing_diagnostic(self, compiled_mm):
         """Diagnostic: print HC-vs-kernel timing per pair; never fails."""
-        result_on = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
-        result_off = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=False)
-
-        def _print_timing(result: dict, label: str) -> None:
-            kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
-            hc_spans = sorted(
-                _host_compute_spans(result["events"]), key=lambda e: e["ts"]
-            )
-            num_pairs = min(len(kernels), len(hc_spans)) - 1
-            ran_ahead = partly_inside = 0
-            print(f"\n[{label}] skew_us={result['skew_us']:.2f}  pairs={num_pairs}")
-            for k in range(max(num_pairs, 0)):
-                k_start = kernels[k]["ts"]
-                k_end = k_start + kernels[k].get("dur", 0)
-                hc_start = hc_spans[k + 1]["ts"]
-                hc_end = hc_start + hc_spans[k + 1].get("dur", 0)
-                inside = _starts_inside(hc_spans[k + 1], kernels[k])
-                ahead = _ends_before(hc_spans[k + 1], kernels[k])
-                if inside:
-                    partly_inside += 1
-                if ahead:
-                    ran_ahead += 1
-                print(
-                    f"  pair {k}: kernel_dur={k_end - k_start:.0f}µs  "
-                    f"hc_dur={hc_end - hc_start:.0f}µs  "
-                    f"hc_end→k_start={k_start - hc_end:+.0f}µs  "
-                    f"hc_start_inside={'YES' if inside else 'no'}  "
-                    f"hc_ends_before={'YES' if ahead else 'no'}"
-                )
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
+        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
+        hc_spans = sorted(_host_compute_spans(result["events"]), key=lambda e: e["ts"])
+        num_pairs = min(len(kernels), len(hc_spans)) - 1
+        ran_ahead = partly_inside = 0
+        print(f"\nskew_us={result['skew_us']:.2f}  pairs={num_pairs}")
+        for k in range(max(num_pairs, 0)):
+            k_start = kernels[k]["ts"]
+            k_end = k_start + kernels[k].get("dur", 0)
+            hc_start = hc_spans[k + 1]["ts"]
+            hc_end = hc_start + hc_spans[k + 1].get("dur", 0)
+            inside = _starts_inside(hc_spans[k + 1], kernels[k])
+            ahead = _ends_before(hc_spans[k + 1], kernels[k])
+            if inside:
+                partly_inside += 1
+            if ahead:
+                ran_ahead += 1
             print(
-                f"  → ran_ahead={ran_ahead}/{num_pairs}  partly_inside={partly_inside}/{num_pairs}"
+                f"  pair {k}: kernel_dur={k_end - k_start:.0f}µs  "
+                f"hc_dur={hc_end - hc_start:.0f}µs  "
+                f"hc_end→k_start={k_start - hc_end:+.0f}µs  "
+                f"hc_start_inside={'YES' if inside else 'no'}  "
+                f"hc_ends_before={'YES' if ahead else 'no'}"
             )
-
-        _print_timing(result_on, "tracker-on")
-        _print_timing(result_off, "tracker-off")
+        print(
+            f"  → ran_ahead={ran_ahead}/{num_pairs}  partly_inside={partly_inside}/{num_pairs}"
+        )
 
     def test_raw_edge_kernel_after_h2d(self, compiled_mm):
         """RAW edge: kernel k starts after its own correction H2D ends."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
 
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
         memcpys = sorted(_memcpy_events(result["events"]), key=lambda e: e["ts"])
@@ -289,7 +278,7 @@ class TestSplitExecutionTrace:
 
     def test_war_edge_h2d_after_preceding_kernel(self, compiled_mm):
         """WAR edge: correction H2D k+1 starts after kernel k ends."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
 
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
         h2ds = sorted(
@@ -325,7 +314,7 @@ class TestSplitExecutionTrace:
 
     def test_profiled_outputs_match_cpu(self, compiled_mm):
         """Outputs collected inside the profiled region match the CPU reference."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES, tracker_on=True)
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
 
         for k, (out, ref) in enumerate(zip(result["outputs"], result["refs"])):
             rel_frob = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
