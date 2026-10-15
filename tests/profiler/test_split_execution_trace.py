@@ -156,21 +156,22 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     pairs_spyre = [(a.to(device), b.to(device)) for a, b in pairs_cpu]
     torch.accelerator.synchronize(device)
 
-    outputs_cpu = []
     refs = [torch.mm(a.float(), b.float()) for a, b in pairs_cpu]
 
     with TemporaryFileName(mode="w+") as trace_path:
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
         ) as prof:
-            for a_s, b_s in pairs_spyre:
-                out = compiled_fn(a_s, b_s)
-                outputs_cpu.append(out.cpu().float())
+            # No device-to-host reads in the loop: they would block each
+            # launch on the previous kernel and prevent any overlap.
+            outs = [compiled_fn(a_s, b_s) for a_s, b_s in pairs_spyre]
             torch.accelerator.synchronize(device)
 
         prof.export_chrome_trace(trace_path)
         with open(trace_path) as f:
             trace_data = json.load(f)
+
+    outputs_cpu = [out.cpu().float() for out in outs]
 
     raw_events = _complete_events(trace_data.get("traceEvents", []))
     skew = _skew_us(raw_events)
