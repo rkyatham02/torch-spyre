@@ -116,6 +116,49 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
     }
 
 
+def _child_s_prep_queued_work() -> dict:
+    """Child: launch mm back to back and sample S_prep right after each launch."""
+    import torch
+    import torch._dynamo
+
+    import torch_spyre  # noqa: F401  # registers the backend
+    from torch_spyre import _C
+
+    torch._dynamo.reset()
+    torch.manual_seed(2)
+    device = torch.device("spyre")
+    num_launches = 3
+
+    pairs = [
+        (
+            torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device),
+            torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device),
+        )
+        for _ in range(num_launches)
+    ]
+    compiled = torch.compile(torch.mm, backend="inductor")
+    compiled(*pairs[0])
+    torch.accelerator.synchronize(device)
+
+    s_prep = _C.host_compute_stream_by_id(65, device)
+
+    # No device-to-host reads here: they would drain the streams before the
+    # sample. Launch k+1's H2D waits for kernel k (WAR), so S_prep holds work
+    # while the preceding kernel is still running.
+    idle_after_launch = []
+    outs = []
+    for a, b in pairs:
+        outs.append(compiled(a, b))
+        idle_after_launch.append(s_prep.query())
+
+    torch.accelerator.synchronize(device)
+    return {
+        "tracker_enabled": _C.get_hazard_tracker_enabled(),
+        "s_prep_id": s_prep.id(),
+        "idle_after_launch": idle_after_launch,
+    }
+
+
 def _child_single_launch_correctness(tracker_on: bool) -> dict:
     """Child: compile and run mm once; results returned as plain lists."""
     import torch
@@ -327,6 +370,37 @@ class TestSPrepRouting:
         assert "HostCompute" in result["step_types"], (
             "Even with tracker off the mm plan must still contain HostCompute "
             f"(plan shape is tracker-agnostic). Got: {result['step_types']}"
+        )
+
+    def test_tracker_on_queues_work_on_s_prep(self, shared_compile_cache):
+        """Tracker on: S_prep has pending work right after back-to-back launches."""
+        result = _run_in_child(
+            _child_s_prep_queued_work,
+            args=(),
+            env_overrides=_tracker_on_env(),
+            cache_dir=shared_compile_cache,
+            timeout=180.0,
+        )
+        assert result["tracker_enabled"] is True
+        assert result["s_prep_id"] == 65
+        assert not all(result["idle_after_launch"]), (
+            "S_prep was idle after every launch with the tracker on — "
+            f"HostCompute/H2D were not routed to it: {result['idle_after_launch']}"
+        )
+
+    def test_tracker_off_leaves_s_prep_idle(self, shared_compile_cache):
+        """Tracker off: S_prep never receives work."""
+        result = _run_in_child(
+            _child_s_prep_queued_work,
+            args=(),
+            env_overrides=_tracker_off_env(),
+            cache_dir=shared_compile_cache,
+            timeout=180.0,
+        )
+        assert result["tracker_enabled"] is False
+        assert all(result["idle_after_launch"]), (
+            "S_prep had pending work with the tracker off — steps were routed "
+            f"to it despite the single-stream fallback: {result['idle_after_launch']}"
         )
 
 
