@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Split-execution parity and routing tests (issue #2889, PR #4419).
+"""Split-execution parity and routing tests (issue #2889,).
 
 Every test runs on a Spyre device in a child process; the parent pytest
 process never opens the device.  Plan-shape assertions live in

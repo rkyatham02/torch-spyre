@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Split-execution trace tests (issue #2889, PR #4419)."""
+"""Split-execution trace tests (issue #2889)."""
 
 import json
 import math
