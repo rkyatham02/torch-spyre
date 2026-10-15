@@ -211,12 +211,20 @@ class TestSplitExecutionTrace:
             "or the span was removed (post-#3488): update this file accordingly."
         )
 
-    def test_host_compute_timing_diagnostic(self, compiled_mm):
-        """Diagnostic: print HC-vs-kernel timing per pair; never fails."""
+    def test_host_compute_runs_ahead_of_kernel(self, compiled_mm):
+        """HostCompute for launch k+1 ends before kernel k ends in at least one pair.
+
+        Timings are printed per pair (use -s). The assertion is deliberately
+        weak because overlap depends on hardware and scheduler state.
+        """
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
         hc_spans = sorted(_host_compute_spans(result["events"]), key=lambda e: e["ts"])
         num_pairs = min(len(kernels), len(hc_spans)) - 1
+        assert num_pairs >= 1, (
+            f"Need at least 2 kernels and 2 HostCompute spans, got "
+            f"{len(kernels)} kernels and {len(hc_spans)} spans."
+        )
         ran_ahead = partly_inside = 0
         print(f"\nskew_us={result['skew_us']:.2f}  pairs={num_pairs}")
         for k in range(max(num_pairs, 0)):
@@ -239,6 +247,11 @@ class TestSplitExecutionTrace:
             )
         print(
             f"  → ran_ahead={ran_ahead}/{num_pairs}  partly_inside={partly_inside}/{num_pairs}"
+        )
+        assert ran_ahead >= 1, (
+            f"HostCompute never finished before the preceding kernel ended "
+            f"(ran_ahead=0/{num_pairs}); host prep is not overlapping device "
+            f"compute. skew_us={result['skew_us']:.2f}"
         )
 
     def test_raw_edge_kernel_after_h2d(self, compiled_mm):
