@@ -191,7 +191,14 @@ def _child_back_to_back(
     num_launches: int,
     shift: int,
 ) -> dict:
-    """Child: run mm num_launches times in order (k + shift) % n; return lists."""
+    """Child: run mm num_launches times in order (k + shift) % n; return lists.
+
+    Also returns ``output_addrs_by_pair``: the device address of each output
+    tensor keyed by pair index.  The parent uses this to detect address clashes
+    between the tracker-on and tracker-off children — a clash would mean a
+    "correct" result could be a stale value left by the other child rather than
+    a freshly computed one, which would let a missing WAR/RAW edge go undetected.
+    """
     import torch
     import torch._dynamo
 
@@ -215,11 +222,18 @@ def _child_back_to_back(
 
     outputs_by_pair: dict[int, list] = {}
     refs_by_pair: dict[int, list] = {}
+    output_addrs_by_pair: dict[int, int] = {}
     for k in range(num_launches):
         idx = (k + shift) % num_launches
         a_s, b_s = pairs_spyre[idx]
         a_c, b_c = pairs_cpu[idx]
-        out = compiled(a_s, b_s).cpu().float().tolist()
+        out_spyre = compiled(a_s, b_s)
+        # Record the device address before pulling the result to the host.
+        # tensor.data_ptr() returns the raw device pointer so we can compare
+        # address sets across children without keeping device tensors alive in
+        # the parent process.
+        output_addrs_by_pair[idx] = out_spyre.data_ptr()
+        out = out_spyre.cpu().float().tolist()
         ref = torch.mm(a_c.float(), b_c.float()).float().tolist()
         outputs_by_pair[idx] = out
         refs_by_pair[idx] = ref
@@ -234,6 +248,7 @@ def _child_back_to_back(
         "outputs": outputs,
         "refs": refs,
         "outputs_by_pair": outputs_by_pair,
+        "output_addrs_by_pair": output_addrs_by_pair,
     }
 
 
@@ -495,6 +510,51 @@ class TestBackToBackParity:
                 rtol=0.05,
                 msg=f"tracker_off back-to-back launch {k} mismatch vs CPU",
             )
+
+    def test_no_pair_lands_where_tracker_off_left_its_result(
+        self, shared_compile_cache
+    ):
+        """tracker-on output addresses don't overlap tracker-off output addresses.
+
+        Device memory is not cleared on allocation, so if the tracker-on child
+        allocates an output tensor at the same address the tracker-off child
+        already wrote its (correct) result to, test_tracker_on_off_outputs_are_identical
+        could silently pass even with a missing WAR/RAW edge — a real corruption
+        would read back stale correct bytes rather than wrong values.
+
+        This test runs both children and asserts the sets of device addresses used
+        for outputs are disjoint, so any agreement in the cross-mode comparison is
+        a real freshly-computed match, not a stale-memory coincidence.
+
+        If this test fails with an address clash, do not merge: the correctness
+        comparison in test_tracker_on_off_outputs_are_identical is unreliable for
+        any pair whose address is in the intersection.
+        """
+        result_on = _run_in_child(
+            _child_back_to_back,
+            args=(True, _NUM_BACK_TO_BACK, 1),
+            env_overrides=_tracker_on_env(),
+            cache_dir=shared_compile_cache,
+        )
+        result_off = _run_in_child(
+            _child_back_to_back,
+            args=(False, _NUM_BACK_TO_BACK, 0),
+            env_overrides=_tracker_off_env(),
+            cache_dir=shared_compile_cache,
+        )
+
+        addrs_on: set[int] = set(result_on["output_addrs_by_pair"].values())
+        addrs_off: set[int] = set(result_off["output_addrs_by_pair"].values())
+        clashes = addrs_on & addrs_off
+
+        assert not clashes, (
+            f"{len(clashes)} output tensor address(es) are shared between the "
+            "tracker-on and tracker-off children — stale correct bytes at the "
+            "clashing address(es) could mask a missing WAR/RAW edge in "
+            "test_tracker_on_off_outputs_are_identical.  "
+            f"Clashing addresses: {sorted(hex(a) for a in clashes)}.  "
+            "See open question #7 in the PR findings doc."
+        )
 
     def test_tracker_on_off_outputs_are_identical(self, shared_compile_cache):
         """tracker on and off produce identical outputs for every input pair."""
