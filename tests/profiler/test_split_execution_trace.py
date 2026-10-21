@@ -140,7 +140,13 @@ def compiled_mm():
 def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     """Run num_launches mm calls under the profiler.
 
-    Returns "events" (skew-corrected), "outputs", "refs", and "skew_us".
+    Returns "events" (profiler's calibrated timestamps, unadjusted),
+    "outputs", "refs", and "skew_us" (diagnostic only, not applied).
+
+    The profiler already emits calibrated timestamps via
+    FLEX_TIMESTAMP_CALIBRATION; subtracting an additional heuristic skew
+    (kernel_ts - launch_call_ts) would include real submission/queuing delay
+    and could create apparent overlap that does not exist in wall-clock time.
     """
     device = torch.device("spyre")
     torch.manual_seed(3)
@@ -174,11 +180,11 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     outputs_cpu = [out.cpu().float() for out in outs]
 
     raw_events = _complete_events(trace_data.get("traceEvents", []))
+    # Compute skew for diagnostic printing only; do not apply it to events.
     skew = _skew_us(raw_events)
-    corrected = _apply_skew(raw_events, skew)
 
     return {
-        "events": corrected,
+        "events": raw_events,
         "outputs": outputs_cpu,
         "refs": refs,
         "skew_us": skew,
@@ -216,10 +222,21 @@ class TestSplitExecutionTrace:
         )
 
     def test_host_compute_runs_ahead_of_kernel(self, compiled_mm):
-        """HostCompute for launch k+1 ends before kernel k ends in at least one pair.
+        """HostCompute[k+1] overlaps with kernel[k] in at least one pair.
 
-        Timings are printed per pair (use -s). The assertion is deliberately
-        weak because overlap depends on hardware and scheduler state.
+        Overlap is defined as a positive interval intersection:
+            hc_start < k_end  AND  k_start < hc_end
+        meaning the two time windows genuinely share wall-clock time.
+
+        ``ran_ahead`` additionally requires hc_end < k_end (HostCompute
+        finishes *within* the kernel window, the strongest form of overlap).
+        The assertion is on ``partly_inside`` (genuine overlap) because
+        ``ran_ahead`` alone also passes when HostCompute ends before the
+        kernel even starts, which does not prove concurrency.
+
+        Timings are printed per pair (use -s).  The assertion is deliberately
+        weak (>= 1 pair) because overlap depends on hardware and scheduler
+        state.
         """
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
@@ -230,32 +247,35 @@ class TestSplitExecutionTrace:
             f"{len(kernels)} kernels and {len(hc_spans)} spans."
         )
         ran_ahead = partly_inside = 0
-        print(f"\nskew_us={result['skew_us']:.2f}  pairs={num_pairs}")
-        for k in range(max(num_pairs, 0)):
+        print(f"\nskew_us={result['skew_us']:.2f} (diagnostic only)  pairs={num_pairs}")
+        for k in range(num_pairs):
             k_start = kernels[k]["ts"]
             k_end = k_start + kernels[k].get("dur", 0)
             hc_start = hc_spans[k + 1]["ts"]
             hc_end = hc_start + hc_spans[k + 1].get("dur", 0)
-            inside = _starts_inside(hc_spans[k + 1], kernels[k])
-            ahead = _ends_before(hc_spans[k + 1], kernels[k])
-            if inside:
+            # Positive interval intersection: windows genuinely overlap.
+            overlaps = hc_start < k_end and k_start < hc_end
+            # Stricter: HostCompute also finishes before the kernel ends.
+            ahead = overlaps and hc_end < k_end
+            if overlaps:
                 partly_inside += 1
             if ahead:
                 ran_ahead += 1
             print(
                 f"  pair {k}: kernel_dur={k_end - k_start:.0f}µs  "
                 f"hc_dur={hc_end - hc_start:.0f}µs  "
-                f"hc_end→k_start={k_start - hc_end:+.0f}µs  "
-                f"hc_start_inside={'YES' if inside else 'no'}  "
-                f"hc_ends_before={'YES' if ahead else 'no'}"
+                f"hc_end→k_end={k_end - hc_end:+.0f}µs  "
+                f"overlaps={'YES' if overlaps else 'no'}  "
+                f"ran_ahead={'YES' if ahead else 'no'}"
             )
         print(
-            f"  → ran_ahead={ran_ahead}/{num_pairs}  partly_inside={partly_inside}/{num_pairs}"
+            f"  → partly_inside={partly_inside}/{num_pairs}  ran_ahead={ran_ahead}/{num_pairs}"
         )
-        assert ran_ahead >= 1, (
-            f"HostCompute never finished before the preceding kernel ended "
-            f"(ran_ahead=0/{num_pairs}); host prep is not overlapping device "
-            f"compute. skew_us={result['skew_us']:.2f}"
+        assert partly_inside >= 1, (
+            f"HostCompute[k+1] never overlapped kernel[k] "
+            f"(partly_inside=0/{num_pairs}); host prep is not running "
+            f"concurrently with device compute. skew_us={result['skew_us']:.2f} "
+            f"(diagnostic, not applied to timestamps)"
         )
 
     def test_raw_edge_kernel_after_h2d(self, compiled_mm):
