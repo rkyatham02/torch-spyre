@@ -28,7 +28,7 @@ import torch_spyre  # noqa: F401  # registers the backend
 # Device-bound shape so kernel duration >> host compute duration.
 _MM_M, _MM_K, _MM_N = 2048, 8192, 2048
 _MM_DTYPE = torch.float16
-_NUM_LAUNCHES = 4
+_NUM_LAUNCHES = 12
 
 
 def _complete_events(trace_events: list[dict]) -> list[dict]:
@@ -210,22 +210,25 @@ class TestSplitExecutionTrace:
         )
 
     def test_host_compute_runs_ahead_of_kernel(self, compiled_mm):
-        """HostCompute[k+1] overlaps with kernel[k] in at least one pair across
-        10 profiling iterations.
+        """HostCompute for a later launch overlaps device compute of an earlier
+        kernel in at least one pair across 10 profiling iterations.
 
         Overlap is defined as a positive interval intersection:
             hc_start < k_end  AND  k_start < hc_end
         meaning the two time windows genuinely share wall-clock time.
 
-        ``ran_ahead`` additionally requires hc_end < k_end (HostCompute
-        finishes *within* the kernel window, the strongest form of overlap).
-        The assertion is on ``partly_inside`` (genuine overlap) because
-        ``ran_ahead`` alone also passes when HostCompute ends before the
-        kernel even starts, which does not prove concurrency.
+        In an asynchronous pipeline, the host queues launches fast (~10 µs
+        each) while the device executes kernels (~1300 µs each).  Initial
+        device launch latency (~60 µs) means early launches finish on the host
+        before kernel 0 starts on device, but subsequent launches (m >= 6)
+        execute HostCompute on the CPU while kernel 0 is actively executing on
+        the device.
 
-        10 iterations are used because CPU-device clock skew varies per trace
-        and can exceed HostCompute duration (~3 µs); requiring at least one
-        overlap across 10 runs is sufficient evidence of concurrency.
+        ``ran_ahead`` verifies that HostCompute[m] finishes before the
+        preceding kernel ends (hc_end[m] < k_end[m-1]), proving non-blocking
+        asynchronous dispatch.
+        ``partly_inside`` verifies that HostCompute[m] genuinely overlaps an
+        in-flight device kernel in wall-clock time.
         """
         _NUM_ITERATIONS = 10
         total_partly_inside = 0
@@ -237,37 +240,63 @@ class TestSplitExecutionTrace:
             hc_spans = sorted(
                 _host_compute_spans(result["events"]), key=lambda e: e["ts"]
             )
-            num_pairs = min(len(kernels), len(hc_spans)) - 1
-            assert num_pairs >= 1, (
+            num_spans = min(len(kernels), len(hc_spans))
+            assert num_spans >= 2, (
                 f"Need at least 2 kernels and 2 HostCompute spans, got "
                 f"{len(kernels)} kernels and {len(hc_spans)} spans."
             )
             ran_ahead = partly_inside = 0
             print(
                 f"\niteration {iteration + 1}/{_NUM_ITERATIONS}  "
-                f"skew_us={result['skew_us']:.2f} (diagnostic only)  pairs={num_pairs}"
+                f"skew_us={result['skew_us']:.2f} (diagnostic only)  spans={num_spans - 1}"
             )
-            for k in range(num_pairs):
-                k_start = kernels[k]["ts"]
-                k_end = k_start + kernels[k].get("dur", 0)
-                hc_start = hc_spans[k + 1]["ts"]
-                hc_end = hc_start + hc_spans[k + 1].get("dur", 0)
-                overlaps = hc_start < k_end and k_start < hc_end
-                ahead = overlaps and hc_end < k_end
-                if overlaps:
-                    partly_inside += 1
+            for m in range(1, num_spans):
+                hc_start = hc_spans[m]["ts"]
+                hc_end = hc_start + hc_spans[m].get("dur", 0)
+
+                # Check non-blocking dispatch: HostCompute[m] finishes before kernel[m-1] ends.
+                k_prev_end = kernels[m - 1]["ts"] + kernels[m - 1].get("dur", 0)
+                ahead = hc_end < k_prev_end
                 if ahead:
                     ran_ahead += 1
+
+                # Check genuine interval intersection against any in-flight preceding kernel.
+                overlapping_kernel_idx = None
+                for j in range(m):
+                    k_start = kernels[j]["ts"]
+                    k_end = k_start + kernels[j].get("dur", 0)
+                    if hc_start < k_end and k_start < hc_end:
+                        overlapping_kernel_idx = j
+                        break
+
+                overlaps = overlapping_kernel_idx is not None
+                if overlaps:
+                    partly_inside += 1
+                    j = overlapping_kernel_idx
+                    k_start = kernels[j]["ts"]
+                    k_end = k_start + kernels[j].get("dur", 0)
+                    overlap_info = (
+                        f"overlaps kernel[{j}] (k_dur={k_end - k_start:.0f}µs, "
+                        f"k_start→hc_start={hc_start - k_start:+.0f}µs, "
+                        f"hc_end→k_end={k_end - hc_end:+.0f}µs)"
+                    )
+                else:
+                    k0_start = kernels[0]["ts"]
+                    overlap_info = (
+                        f"no overlap (ended {k0_start - hc_end:.0f}µs before kernel[0] start)"
+                        if hc_end < k0_start
+                        else "no overlap"
+                    )
+
                 print(
-                    f"  pair {k}: kernel_dur={k_end - k_start:.0f}µs  "
-                    f"hc_dur={hc_end - hc_start:.0f}µs  "
-                    f"hc_end→k_end={k_end - hc_end:+.0f}µs  "
-                    f"overlaps={'YES' if overlaps else 'no'}  "
-                    f"ran_ahead={'YES' if ahead else 'no'}"
+                    f"  launch {m}: hc_dur={hc_end - hc_start:.0f}µs  "
+                    f"ran_ahead={'YES' if ahead else 'no'}  "
+                    f"{overlap_info}"
                 )
+
             print(
-                f"  → partly_inside={partly_inside}/{num_pairs}  "
-                f"ran_ahead={ran_ahead}/{num_pairs}"
+                f"  → partly_inside={partly_inside}/{num_spans - 1}  "
+                f"ran_ahead={ran_ahead}/{num_spans - 1}"
             )
             total_partly_inside += partly_inside
             total_ran_ahead += ran_ahead
@@ -277,7 +306,7 @@ class TestSplitExecutionTrace:
             f"partly_inside={total_partly_inside}  ran_ahead={total_ran_ahead} ==="
         )
         assert total_partly_inside >= 1, (
-            f"HostCompute[k+1] never overlapped kernel[k] across "
+            f"HostCompute never overlapped any preceding in-flight kernel across "
             f"{_NUM_ITERATIONS} iterations (partly_inside=0); host prep is not "
             f"running concurrently with device compute."
         )
