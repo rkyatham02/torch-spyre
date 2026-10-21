@@ -97,18 +97,6 @@ def _skew_us(events: list[dict]) -> float:
     return deltas[mid] if len(deltas) % 2 else (deltas[mid - 1] + deltas[mid]) / 2.0
 
 
-def _apply_skew(events: list[dict], skew_us: float) -> list[dict]:
-    """Shift device-clock ts values by -skew_us."""
-    device_cats = {"kernel", "gpu_memcpy"}
-    result = []
-    for ev in events:
-        if ev.get("cat") in device_cats:
-            ev = dict(ev)
-            ev["ts"] = ev["ts"] - skew_us
-        result.append(ev)
-    return result
-
-
 def _starts_inside(inner: dict, outer: dict) -> bool:
     return outer["ts"] <= inner["ts"] < outer["ts"] + outer.get("dur", 0)
 
