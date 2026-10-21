@@ -117,7 +117,7 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
 
 
 def _child_s_prep_queued_work() -> dict:
-    """Child: launch mm back to back and sample S_prep right after each launch."""
+    """Child: launch mm back to back and sample S_prep after the full batch."""
     import torch
     import torch._dynamo
 
@@ -142,20 +142,21 @@ def _child_s_prep_queued_work() -> dict:
 
     s_prep = _C.host_compute_stream_by_id(65, device)
 
-    # No device-to-host reads here: they would drain the streams before the
-    # sample. Launch k+1's H2D waits for kernel k (WAR), so S_prep holds work
-    # while the preceding kernel is still running.
-    idle_after_launch = []
+    # Enqueue the full batch, then poll once before synchronize. HostCompute
+    # (~3-5 µs) drains before Python resumes each compiled() call, so
+    # per-launch polls always see idle. The WAR-blocked H2Ds for launches
+    # 1..N-1 are still pending on S_prep while kernel[0] runs.
     outs = []
     for a, b in pairs:
         outs.append(compiled(a, b))
-        idle_after_launch.append(s_prep.query())
+
+    s_prep_idle_after_batch = s_prep.query()
 
     torch.accelerator.synchronize(device)
     return {
         "tracker_enabled": _C.get_hazard_tracker_enabled(),
         "s_prep_id": s_prep.id(),
-        "idle_after_launch": idle_after_launch,
+        "s_prep_idle_after_batch": s_prep_idle_after_batch,
     }
 
 
@@ -384,7 +385,7 @@ class TestSPrepRouting:
         )
 
     def test_tracker_on_queues_work_on_s_prep(self, shared_compile_cache):
-        """Tracker on: S_prep has pending work right after back-to-back launches."""
+        """Tracker on: S_prep has pending work after the full batch is enqueued."""
         result = _run_in_child(
             _child_s_prep_queued_work,
             args=(),
@@ -394,9 +395,9 @@ class TestSPrepRouting:
         )
         assert result["tracker_enabled"] is True
         assert result["s_prep_id"] == 65
-        assert not all(result["idle_after_launch"]), (
-            "S_prep was idle after every launch with the tracker on — "
-            f"HostCompute/H2D were not routed to it: {result['idle_after_launch']}"
+        assert not result["s_prep_idle_after_batch"], (
+            "S_prep was idle after enqueuing the full batch with tracker on — "
+            "WAR-blocked H2Ds were not routed to it."
         )
 
     def test_tracker_off_leaves_s_prep_idle(self, shared_compile_cache):
@@ -409,9 +410,9 @@ class TestSPrepRouting:
             timeout=180.0,
         )
         assert result["tracker_enabled"] is False
-        assert all(result["idle_after_launch"]), (
+        assert result["s_prep_idle_after_batch"], (
             "S_prep had pending work with the tracker off — steps were routed "
-            f"to it despite the single-stream fallback: {result['idle_after_launch']}"
+            "to it despite the single-stream fallback."
         )
 
 
