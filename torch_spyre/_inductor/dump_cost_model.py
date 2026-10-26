@@ -44,6 +44,7 @@ from .cost_model import (
     ArgTraffic,
     OpFeatures,
     _matmul_axes_for_split_cost,
+    _select,
     explain,
     max,
 )
@@ -439,6 +440,74 @@ def _loop_factor_for_index(index, levels, advances=None) -> int:
         if not (syms & free):
             factor *= trip
     return factor
+
+
+def _tiled_flag(counts):
+    """Whether any of ``counts`` actually tiles its axis (is > 1): a bool when
+    the counts are concrete, else a sympy condition over the solver's
+    tile-count symbols (``CoreDivisionBuffer.sym_tile_counts``)."""
+    flag = sympy.Or(*(sympy.Gt(count, 1) for count in counts))
+    if flag in (sympy.true, sympy.false):
+        return bool(flag)
+    return flag
+
+
+def _candidate_tiling(op, tiling: Mapping):
+    """Tiling features of an UNTILED op under a candidate coarse tiling.
+
+    ``tiling`` maps the op's own loop variables to the trip count of the loop
+    that tiles them -- the tiling sibling of ``work_slices``, and like it keyed
+    on iteration symbols, with counts that may be the solver's symbols. Returns
+    ``(levels, loop_trip, tiles_reduction_dim, tiles_output_dim, output_tiles)``,
+    ``levels`` in :func:`_tiled_symbols_per_level`'s form: one level per tiled
+    variable, which is enough for :func:`_loop_factor_for_index`, whose factor
+    is a product over levels and so does not depend on their nesting order.
+    ``output_tiles`` is the product of the counts on output variables.
+
+    A variable the write index does not carry is a reduction variable. The two
+    flags are conditions rather than bools when a count is symbolic, since the
+    candidate the solver picks may leave that axis untiled (count 1).
+
+    The op must not already be coarse-tiled: its ``loop_info`` would describe a
+    second loop nest this cannot compose with.
+    """
+    if getattr(op, "loop_info", None) is not None:
+        raise ValueError(
+            f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
+        )
+    write_index = next(iter(op.get_read_writes().writes)).index
+    out_syms = write_index.free_symbols
+    out_counts = [count for sym, count in tiling.items() if sym in out_syms]
+    red_counts = [count for sym, count in tiling.items() if sym not in out_syms]
+    levels = [(count, {sym}, 1) for sym, count in tiling.items()]
+    return (
+        levels,
+        math.prod(tiling.values()),
+        _tiled_flag(red_counts),
+        _tiled_flag(out_counts),
+        math.prod(out_counts),
+    )
+
+
+def _tile_count(index, tiling: Optional[Mapping]):
+    """Tiles a candidate ``tiling`` cuts the buffer at ``index`` into: the
+    product of the counts on the loop variables the index carries (1 for none,
+    or with no candidate tiling)."""
+    if not tiling or index is None:
+        return 1
+    free = getattr(index, "free_symbols", None) or ()
+    return math.prod(count for sym, count in tiling.items() if sym in free)
+
+
+def _per_tile_elems(elems, is_lx, tiles):
+    """``elems`` as a candidate-tiled buffer reports them, matching a committed
+    tiling: an LX buffer is allocated per tile, an HBM buffer keeps its full
+    extent. ``is_lx`` and ``tiles`` may each be symbolic."""
+    if tiles == 1 or is_lx is False:
+        return elems
+    if is_lx is True:
+        return elems / tiles
+    return elems * (1 - is_lx) + elems / tiles * is_lx
 
 
 def _row_split(op, default: int, work_slices=None) -> int:
@@ -999,17 +1068,53 @@ def governing_run_split(source_view, destination_view, device_dims) -> tuple:
     return min(src, dst, key=lambda t: (t[0], -t[1]))
 
 
-def _relayout_features(op, out_dims):
-    """(is_lx_relayout, relayout_run_elems, relayout_split) for one op.
+def relayout_cost_features(
+    source_view,
+    destination_view,
+    num_cores,
+    device_dims,
+    out_elems,
+    dtype_bytes,
+    *,
+    destination_num_cores=None,
+) -> OpFeatures:
+    """One feature vector for candidate pricing and committed-copy reporting.
+
+    Core counts describe the physical transfer domains, not the copy's loop
+    split product: a full replica has an unsplit loop on many physical cores.
+    ``out_elems`` counts the unique physical tensor, including padding, once.
+    Preserve the existing estimate on the smaller physical domain. Replicated
+    destinations do not multiply that tensor size; this remains a permutation-
+    based estimate, not a calibrated model of replicated receive traffic.
+    At fixed run and split, the smaller count charges more than the larger
+    count. This does not establish an upper bound on measured transfer time.
+    """
+    run_elems, split = governing_run_split(source_view, destination_view, device_dims)
+    return OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=out_elems,
+        cores=num_cores,
+        dtype_bytes=dtype_bytes,
+        args=[],
+        is_lx_relayout=True,
+        relayout_cores=min(num_cores, destination_num_cores or num_cores),
+        relayout_run_elems=run_elems,
+        relayout_split=split,
+    )
+
+
+def _relayout_features(op, out_dims, dtype_bytes):
+    """The certified relayout's shared price features, or None for another op.
 
     The materialization registry is the authority: an op is a relayout copy iff the
     scratchpad planner registered it (``graph._spyre_lx_relayout_copies``), so a plan
     the allocator or scheduler later demoted never reaches here as a relayout. The
     governing geometry is the FINER of the plan's two views (smaller per-core run);
     the term's law is direction-symmetric (measured: 8.721 vs 8.701 us reversed), so
-    which side is source does not matter. All-zeros for every other op.
+    which side is source does not matter. Both physical core domains come from
+    the same plan that supplied the solver's candidate price.
     """
-    zeros = (False, 0, 0)
     try:
         from torch._inductor.virtualized import V
 
@@ -1017,7 +1122,7 @@ def _relayout_features(op, out_dims):
 
         registry = materialized_lx_relayouts(V.graph)
         if not registry:
-            return zeros
+            return None
         # The registry records the COPY BUFFER's name (materialize_lx_relayouts
         # stores ``copy.get_name()``, e.g. "buf2"); ``get_operation_name()`` is the
         # op name ("op2"), so match on the buffer name.
@@ -1026,13 +1131,19 @@ def _relayout_features(op, out_dims):
             (p for copy_name, p in registry.values() if copy_name == name), None
         )
         if plan is None:
-            return zeros
-        run_elems, split = governing_run_split(
-            plan.source_view, plan.destination_view, out_dims
+            return None
+        features = relayout_cost_features(
+            plan.source_view,
+            plan.destination_view,
+            plan.num_cores,
+            out_dims,
+            _prod_ints(out_dims),
+            dtype_bytes,
+            destination_num_cores=plan.destination_view.num_cores,
         )
-        if run_elems <= 0 or split <= 0:
-            return zeros
-        return True, run_elems, split
+        if features.relayout_run_elems <= 0 or features.relayout_split <= 0:
+            return None
+        return features
     except Exception as exc:  # noqa: BLE001 - a diagnostic feature must not sink a compile
         # Deliberately broad, but never silent: a regression in the registry
         # lookup (say an AttributeError from a PerCoreView refactor) must not
@@ -1040,7 +1151,7 @@ def _relayout_features(op, out_dims):
         _relayout_logger().debug(
             "relayout feature extraction failed for %s: %r", op.get_name(), exc
         )
-        return zeros
+        return None
 
 
 def _graph_boundary_names() -> tuple[set, set] | None:
@@ -1221,6 +1332,7 @@ def extract_op_features(
     work_slices=None,
     *,
     is_lx: Optional[Mapping[str, bool]] = None,
+    sym_tiling: Optional[Mapping] = None,
     candidate_work_slices: Optional[Sequence[Mapping[sympy.Symbol, int]]] = None,
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
@@ -1232,6 +1344,14 @@ def extract_op_features(
     ``is_lx`` supplies each arg's residency (symbolic or concrete) by buffer
     name, such as a relayout candidate's forced placement. A name missing from
     it falls back to the buffer's committed layout.
+
+    ``sym_tiling`` is a candidate coarse tiling of the (untiled) op during LX
+    planning: loop variable -> trip count, concrete or the solver's symbols, as
+    ``work_slices`` is for the core split (see :func:`_candidate_tiling`).
+    Otherwise the op's committed ``loop_info`` supplies the tiling. The op's
+    sizes are then the whole loop's, not one tile's, so each LX arg is cut to
+    its per-tile size, as a committed tiling allocates it; an HBM arg keeps
+    its full extent either way.
 
     ``candidate_work_slices`` is the caller's existing legal menu on this op's
     symbol basis, held constant across symbolic and concrete candidate evaluation.
@@ -1249,7 +1369,13 @@ def extract_op_features(
     graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
-    loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
+    if sym_tiling:
+        _levels, loop_trip, tiles_red_dim, tiles_out_dim, output_tiles = (
+            _candidate_tiling(op, sym_tiling)
+        )
+    else:
+        loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
+        _levels = _tiled_symbols_per_level(op)
     # An arg ADVANCES (factor 1, walks the full tensor once across tiles) when this op
     # tiles a dim the arg traverses: an OUTPUT (pointwise) dim -> all args advance; a
     # REDUCTION dim -> only the reduced input advances. An arg is FIXED (factor L,
@@ -1281,10 +1407,11 @@ def extract_op_features(
     )
 
     # Per-level loop structure, shared by the output's loop factor (which also scales a
-    # matmul's work) and every read's (see the PER-ARG comment below).
-    _levels = _tiled_symbols_per_level(op)
+    # matmul's work) and every read's (see the PER-ARG comment below). ``_levels`` is
+    # set above, from the committed loop_info or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
     _li = getattr(op, "loop_info", None)
+    _rw = None
     try:
         _rw = op.get_read_writes()
         _write_index = next(iter(_rw.writes)).index
@@ -1302,7 +1429,7 @@ def extract_op_features(
         )
         out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
     else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
-        out_factor = 1 if tiles_out_dim else loop_trip
+        out_factor = _select(tiles_out_dim, 1, loop_trip)
     _stamped_reads = getattr(_li, "tiled_dims_per_read", None) or []
     _squeezed_reads = getattr(_li, "squeezed_advance_per_read", None) or []
 
@@ -1324,7 +1451,15 @@ def extract_op_features(
             k_split,
             matmul_m_split,
             matmul_n_split,
-        ) = _matmul_features(op, out_elems, dtype_bytes, out_factor, work_slices)
+        ) = _matmul_features(
+            op,
+            out_elems,
+            dtype_bytes,
+            # A candidate-tiled op is still untiled: one pass over its output
+            # already covers the whole K.
+            1 if sym_tiling else out_factor,
+            work_slices,
+        )
         reduction_cores = k_split
 
     # Per-core per-tile pass-row height for the UNDERFILL derate -- only for OUTPUT-dim
@@ -1336,7 +1471,7 @@ def extract_op_features(
     # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
     # N/A -> no derate.
     tile_rows_per_core = 0.0
-    if tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
+    if len(out_dims) >= 2:
         # Row extent from the LOGICAL shape, not the device shape. ``out_dims[-2]`` is
         # the row count only for a rank-2 tensor, whose device layout is rank-3. A
         # rank-3 or rank-4 tensor has a rank-4/5 device layout in which [-2] is a
@@ -1350,14 +1485,20 @@ def extract_op_features(
         # previously modelled; it only repairs rank>=3. Same class of mistake, and the
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
-        # full-buffer alloc: per-tile slice is rows / loop_trip
-        rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
+        if sym_tiling:
+            # A candidate-tiled op is still untiled, so its output's rows are the
+            # whole loop's in LX and HBM alike: the per-tile slice is rows / output
+            # tiles. Not loop_trip, which also counts reduction tiles.
+            rows = rows / output_tiles
+        else:
+            # full-buffer alloc: per-tile slice is rows / loop_trip
+            rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
         # nothing depends on. Guard locally rather than rely on the caller's condition.
         split = _row_split(op, cores, work_slices) or 1
-        tile_rows_per_core = rows / split
+        tile_rows_per_core = _select(tiles_out_dim, rows / split, 0.0)
 
     # PER-ARG, PER-LEVEL loop factors. An operand is re-transferred at a nesting level
     # whose tiled symbol its index does NOT contain, and walked (transferred once) at a
@@ -1376,14 +1517,17 @@ def extract_op_features(
     #                                      (no r0_0) => 1*4; B does the opposite => 2*1.
     # ``_levels``, ``_loop_vars`` and ``out_factor`` are computed above, before the
     # matmul work, which is scaled by the same ``out_factor``.
-    in_factor = 1 if (tiles_out_dim or is_tiled_red) else loop_trip
+    in_factor = _select(tiles_out_dim, 1, _select(is_tiled_red, 1, loop_trip))
 
     # Traffic of an indirect mutation's store (see _indirect_write_elems). Symbolic
     # residency is the chooser's form and must not block it: indirect buffers are
     # never LX-resident, so is_lx is 0 in every legal solution. `out_elems` itself
     # stays the committed device size, which also sizes the compute terms.
+    # A candidate-tiled op is still untiled, and its HBM output keeps the full
+    # extent (see _per_tile_elems), so the store is sized whole under any
+    # candidate -- `loop_trip` is then symbolic and `== 1` would always be False.
     out_write_elems = None
-    if not is_reduction and loop_trip == 1 and out_is_lx is not True:
+    if not is_reduction and (sym_tiling or loop_trip == 1) and out_is_lx is not True:
         out_write_elems = _indirect_write_elems(op, out_elems)
 
     args: list = []
@@ -1395,7 +1539,11 @@ def extract_op_features(
             is_lx=out_is_lx,
             # `dims`/`logical` stay the destination's: they describe the buffer
             # this write lands in, while `elems` counts the bytes it moves.
-            elems=out_elems if out_write_elems is None else out_write_elems,
+            elems=_per_tile_elems(
+                out_elems if out_write_elems is None else out_write_elems,
+                out_is_lx,
+                _tile_count(_write_index, sym_tiling),
+            ),
             dims=list(out_dims),
             logical=list(out_size),
             loop_factor=out_factor,
@@ -1413,8 +1561,10 @@ def extract_op_features(
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
     # layout -- so a reduction's reduced input is naturally full-sized (no separate
     # reduction scaling), and a broadcast operand carries its real (one-row) size.
+    # No dependencies change during feature extraction. Reuse the output snapshot,
+    # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = op.get_read_writes().reads
+        reads = (_rw if _rw is not None else op.get_read_writes()).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
@@ -1465,7 +1615,7 @@ def extract_op_features(
         mem, dims, in_elems, in_logical = _input_traffic(name)
         operand_geometry = (
             _operand_read_geometry(op, dep, work_slices, candidate_work_slices)
-            if is_matmul and loop_trip > 1 and index is not None
+            if is_matmul and not sym_tiling and loop_trip > 1 and index is not None
             else (None, None)
         )
         if in_elems is None:  # unresolved buffer -> fallback
@@ -1510,7 +1660,9 @@ def extract_op_features(
                 name=name,
                 role="input",
                 is_lx=inp_is_lx,
-                elems=in_elems,
+                elems=_per_tile_elems(
+                    in_elems, inp_is_lx, _tile_count(index, sym_tiling)
+                ),
                 broadcast=broadcast,
                 dims=list(dims),
                 logical=list(in_logical) if in_logical else [],
@@ -1541,7 +1693,7 @@ def extract_op_features(
             )
         )
 
-    _rl = _relayout_features(op, out_dims)
+    _rl = _relayout_features(op, out_dims, dtype_bytes)
 
     hbm_pattern = "" if is_matmul else _hbm_pattern(op, is_reduction, out_dims)
     # A staging copy still issues the source DMA even if it is later elided into
@@ -1587,9 +1739,10 @@ def extract_op_features(
         transport_read_run_bytes=transport_read_run_bytes,
         transport_tile_elems=transport_tile_elems,
         transport_compute_read=bool(compute_read and transport_tile_elems),
-        is_lx_relayout=_rl[0],
-        relayout_run_elems=_rl[1],
-        relayout_split=_rl[2],
+        is_lx_relayout=_rl is not None,
+        relayout_cores=_rl.relayout_cores if _rl is not None else 0,
+        relayout_run_elems=_rl.relayout_run_elems if _rl is not None else 0,
+        relayout_split=_rl.relayout_split if _rl is not None else 0,
         # The byte-count check defines which store geometry gets the rate estimate.
         is_indirect_store=out_write_elems is not None,
     )
