@@ -486,6 +486,13 @@ def compile_backend(pytestconfig):
 def pytest_configure(config):
     shared_config._PYTEST_CONFIG = config
 
+    # Set default runtime and profiler flags before device initialization.
+    # Uses os.environ.setdefault so explicit shell-provided overrides take precedence.
+    os.environ.setdefault("SPYRE_HAZARD_TRACKER", "1")
+    os.environ.setdefault("USE_SPYRE_PROFILER", "1")
+    os.environ.setdefault("FLEX_TIMESTAMP_CALIBRATION", "always")
+    os.environ.setdefault("FLEX_SKIP_TIMESTAMP_CALIBRATION", "0")
+
     config.addinivalue_line(
         "markers",
         "requires_spyre_profiler: test requires Spyre hardware "
