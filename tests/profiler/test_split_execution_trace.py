@@ -182,6 +182,93 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     }
 
 
+def _print_overlap_counts(
+    kernels: list[dict], hc_spans: list[dict]
+) -> tuple[int, int, int]:
+    """Print per-launch overlap of HostCompute with earlier kernels.
+
+    Returns (ran_ahead, partly_inside, launches).  Both lists must be sorted by
+    ts.  ran_ahead counts launches m whose HostCompute ends before kernel m-1
+    ends; partly_inside counts launches whose HostCompute positively
+    intersects any earlier kernel.
+    """
+    num_spans = min(len(kernels), len(hc_spans))
+    ran_ahead = partly_inside = 0
+    for m in range(1, num_spans):
+        hc_start = hc_spans[m]["ts"]
+        hc_end = hc_start + hc_spans[m].get("dur", 0)
+
+        # Check non-blocking dispatch: HostCompute[m] finishes before kernel[m-1] ends.
+        k_prev_end = kernels[m - 1]["ts"] + kernels[m - 1].get("dur", 0)
+        ahead = hc_end < k_prev_end
+        if ahead:
+            ran_ahead += 1
+
+        # Check genuine interval intersection against any in-flight preceding kernel.
+        overlapping_kernel_idx = None
+        for j in range(m):
+            k_start = kernels[j]["ts"]
+            k_end = k_start + kernels[j].get("dur", 0)
+            if hc_start < k_end and k_start < hc_end:
+                overlapping_kernel_idx = j
+                break
+
+        if overlapping_kernel_idx is not None:
+            partly_inside += 1
+            j = overlapping_kernel_idx
+            k_start = kernels[j]["ts"]
+            k_end = k_start + kernels[j].get("dur", 0)
+            overlap_info = (
+                f"overlaps kernel[{j}] (k_dur={k_end - k_start:.0f}µs, "
+                f"k_start→hc_start={hc_start - k_start:+.0f}µs, "
+                f"hc_end→k_end={k_end - hc_end:+.0f}µs)"
+            )
+        else:
+            k0_start = kernels[0]["ts"]
+            overlap_info = (
+                f"no overlap (ended {k0_start - hc_end:.0f}µs before kernel[0] start)"
+                if hc_end < k0_start
+                else "no overlap"
+            )
+
+        print(
+            f"  launch {m}: hc_dur={hc_end - hc_start:.0f}µs  "
+            f"ran_ahead={'YES' if ahead else 'no'}  "
+            f"{overlap_info}"
+        )
+
+    launches = max(num_spans - 1, 0)
+    print(
+        f"  → partly_inside={partly_inside}/{launches}  ran_ahead={ran_ahead}/{launches}"
+    )
+    return ran_ahead, partly_inside, launches
+
+
+@pytest.mark.requires_spyre_profiler
+class TestOverlapDiagnostic:
+    """Report host/device overlap for whichever tracker mode the process runs in.
+
+    Asserts nothing: the tracker is latched at startup, so run this file once
+    per mode and compare the printed counts:
+        SPYRE_HAZARD_TRACKER=1 pytest ... -k overlap_diagnostic -s
+        SPYRE_HAZARD_TRACKER=0 pytest ... -k overlap_diagnostic -s
+    Similar counts with the tracker off mean the overlap check measures
+    host/device concurrency, not the split itself.
+    """
+
+    def test_overlap_counts_for_current_tracker_mode(self, compiled_mm):
+        from torch_spyre import _C
+
+        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
+        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
+        hc_spans = sorted(_host_compute_spans(result["events"]), key=lambda e: e["ts"])
+        print(
+            f"\nOVERLAP_DIAGNOSTIC tracker_enabled={_C.get_hazard_tracker_enabled()}  "
+            f"kernels={len(kernels)}  hc_spans={len(hc_spans)}"
+        )
+        _print_overlap_counts(kernels, hc_spans)
+
+
 @pytest.mark.requires_spyre_profiler
 class TestSplitExecutionTrace:
     """Trace-level checks for split-execution correctness (issue #2889).
@@ -242,61 +329,12 @@ class TestSplitExecutionTrace:
             f"{len(kernels)} kernels and {len(hc_spans)} spans."
         )
 
-        ran_ahead = partly_inside = 0
         print(
             f"\nskew_us={result['skew_us']:.2f} (diagnostic only)  spans={num_spans - 1}"
         )
-        for m in range(1, num_spans):
-            hc_start = hc_spans[m]["ts"]
-            hc_end = hc_start + hc_spans[m].get("dur", 0)
-
-            # Check non-blocking dispatch: HostCompute[m] finishes before kernel[m-1] ends.
-            k_prev_end = kernels[m - 1]["ts"] + kernels[m - 1].get("dur", 0)
-            ahead = hc_end < k_prev_end
-            if ahead:
-                ran_ahead += 1
-
-            # Check genuine interval intersection against any in-flight preceding kernel.
-            overlapping_kernel_idx = None
-            for j in range(m):
-                k_start = kernels[j]["ts"]
-                k_end = k_start + kernels[j].get("dur", 0)
-                if hc_start < k_end and k_start < hc_end:
-                    overlapping_kernel_idx = j
-                    break
-
-            overlaps = overlapping_kernel_idx is not None
-            if overlaps:
-                partly_inside += 1
-                j = overlapping_kernel_idx
-                k_start = kernels[j]["ts"]
-                k_end = k_start + kernels[j].get("dur", 0)
-                overlap_info = (
-                    f"overlaps kernel[{j}] (k_dur={k_end - k_start:.0f}µs, "
-                    f"k_start→hc_start={hc_start - k_start:+.0f}µs, "
-                    f"hc_end→k_end={k_end - hc_end:+.0f}µs)"
-                )
-            else:
-                k0_start = kernels[0]["ts"]
-                overlap_info = (
-                    f"no overlap (ended {k0_start - hc_end:.0f}µs before kernel[0] start)"
-                    if hc_end < k0_start
-                    else "no overlap"
-                )
-
-            print(
-                f"  launch {m}: hc_dur={hc_end - hc_start:.0f}µs  "
-                f"ran_ahead={'YES' if ahead else 'no'}  "
-                f"{overlap_info}"
-            )
-
-        print(
-            f"  → partly_inside={partly_inside}/{num_spans - 1}  "
-            f"ran_ahead={ran_ahead}/{num_spans - 1}"
-        )
+        ran_ahead, partly_inside, launches = _print_overlap_counts(kernels, hc_spans)
         # Thresholds come from 10 serial runs on the device-bound shape:
         # worst case ran_ahead=11/11 and partly_inside=7/11.
-        launches = num_spans - 1
         min_ran_ahead = math.ceil(_MIN_RAN_AHEAD_FRACTION * launches)
         min_partly_inside = math.ceil(_MIN_PARTLY_INSIDE_FRACTION * launches)
         assert ran_ahead >= min_ran_ahead, (
