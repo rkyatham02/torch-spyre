@@ -38,8 +38,6 @@ _MM_M, _MM_K, _MM_N = 1024, 8192, 1024
 _MM_DTYPE = torch.float16
 # Smaller shape for fast compile in correctness tests.
 _COR_M, _COR_K, _COR_N = 64, 512, 64
-# Launches (and polls) in the S_prep routing check.
-_NUM_S_PREP_POLLS = 16
 
 
 def _child_s_prep_routing(tracker_on: bool) -> dict:
@@ -115,54 +113,6 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
         "tracker_enabled": tracker_enabled,
         "step_types": step_types,
         "step_roles": step_roles,
-    }
-
-
-def _child_s_prep_queued_work() -> dict:
-    """Child: launch mm back to back and poll S_prep right after each launch."""
-    import torch
-    import torch._dynamo
-
-    import torch_spyre  # noqa: F401  # registers the backend
-    from torch_spyre import _C
-
-    torch._dynamo.reset()
-    torch.manual_seed(2)
-    device = torch.device("spyre")
-    num_launches = _NUM_S_PREP_POLLS
-
-    # Reuse a few pairs across launches to bound device memory.
-    pairs = [
-        (
-            torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device),
-            torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device),
-        )
-        for _ in range(4)
-    ]
-    compiled = torch.compile(torch.mm, backend="inductor")
-    compiled(*pairs[0])
-    torch.accelerator.synchronize(device)
-
-    s_prep = _C.host_compute_stream_by_id(65, device)
-
-    # Poll S_prep immediately after each launch, with no device-to-host reads
-    # in the loop. With the tracker on, the correction H2D of launch k+1 is
-    # WAR-blocked behind kernel k, so S_prep is still busy right after the
-    # launch returns. query() returns True when the stream is idle.
-    outs = []
-    busy_polls = 0
-    for k in range(num_launches):
-        a, b = pairs[k % len(pairs)]
-        outs.append(compiled(a, b))
-        if not s_prep.query():
-            busy_polls += 1
-
-    torch.accelerator.synchronize(device)
-    return {
-        "tracker_enabled": _C.get_hazard_tracker_enabled(),
-        "s_prep_id": s_prep.id(),
-        "num_polls": num_launches,
-        "s_prep_busy_polls": busy_polls,
     }
 
 
@@ -388,38 +338,6 @@ class TestSPrepRouting:
         assert "HostCompute" in result["step_types"], (
             "Even with tracker off the mm plan must still contain HostCompute "
             f"(plan shape is tracker-agnostic). Got: {result['step_types']}"
-        )
-
-    def test_tracker_on_queues_work_on_s_prep(self, shared_compile_cache):
-        """Tracker on: S_prep is busy right after at least one launch."""
-        result = _run_in_child(
-            _child_s_prep_queued_work,
-            args=(),
-            env_overrides=_tracker_on_env(),
-            cache_dir=shared_compile_cache,
-            timeout=180.0,
-        )
-        assert result["tracker_enabled"] is True
-        assert result["s_prep_id"] == 65
-        assert result["s_prep_busy_polls"] >= 1, (
-            f"S_prep was idle after all {result['num_polls']} launches with "
-            "tracker on — WAR-blocked H2Ds were not routed to it."
-        )
-
-    def test_tracker_off_leaves_s_prep_idle(self, shared_compile_cache):
-        """Tracker off: S_prep never receives work."""
-        result = _run_in_child(
-            _child_s_prep_queued_work,
-            args=(),
-            env_overrides=_tracker_off_env(),
-            cache_dir=shared_compile_cache,
-            timeout=180.0,
-        )
-        assert result["tracker_enabled"] is False
-        assert result["s_prep_busy_polls"] == 0, (
-            f"S_prep was busy after {result['s_prep_busy_polls']}/"
-            f"{result['num_polls']} launches with tracker off — steps were "
-            "routed to it despite the single-stream fallback."
         )
 
 

@@ -291,6 +291,11 @@ class TestSplitExecutionTrace:
             f"  → partly_inside={partly_inside}/{num_spans - 1}  "
             f"ran_ahead={ran_ahead}/{num_spans - 1}"
         )
+        assert ran_ahead >= 1, (
+            f"HostCompute never finished before the preceding kernel ended "
+            f"(ran_ahead=0/{num_spans - 1}); host prep is not running ahead "
+            f"of device compute."
+        )
         assert partly_inside >= 1, (
             f"HostCompute never overlapped any preceding in-flight kernel "
             f"(partly_inside=0/{num_spans - 1}); host prep is not running "
