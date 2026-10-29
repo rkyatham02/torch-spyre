@@ -256,7 +256,7 @@ class TestOverlapDiagnostic:
     host/device concurrency, not the split itself.
     """
 
-    def test_overlap_counts_for_current_tracker_mode(self, compiled_mm):
+    def test_overlap_diagnostic_for_current_tracker_mode(self, compiled_mm):
         from torch_spyre import _C
 
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
