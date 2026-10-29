@@ -38,6 +38,8 @@ _MM_M, _MM_K, _MM_N = 1024, 8192, 1024
 _MM_DTYPE = torch.float16
 # Smaller shape for fast compile in correctness tests.
 _COR_M, _COR_K, _COR_N = 64, 512, 64
+# Launches (and polls) in the S_prep routing check.
+_NUM_S_PREP_POLLS = 16
 
 
 def _child_s_prep_routing(tracker_on: bool) -> dict:
