@@ -119,7 +119,7 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
 
 
 def _child_s_prep_queued_work() -> dict:
-    """Child: launch mm back to back and sample S_prep after the full batch."""
+    """Child: launch mm back to back and poll S_prep right after each launch."""
     import torch
     import torch._dynamo
 
@@ -129,14 +129,15 @@ def _child_s_prep_queued_work() -> dict:
     torch._dynamo.reset()
     torch.manual_seed(2)
     device = torch.device("spyre")
-    num_launches = 3
+    num_launches = _NUM_S_PREP_POLLS
 
+    # Reuse a few pairs across launches to bound device memory.
     pairs = [
         (
             torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device),
             torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device),
         )
-        for _ in range(num_launches)
+        for _ in range(4)
     ]
     compiled = torch.compile(torch.mm, backend="inductor")
     compiled(*pairs[0])
@@ -144,21 +145,24 @@ def _child_s_prep_queued_work() -> dict:
 
     s_prep = _C.host_compute_stream_by_id(65, device)
 
-    # Enqueue the full batch, then poll once before synchronize. HostCompute
-    # (~3-5 µs) drains before Python resumes each compiled() call, so
-    # per-launch polls always see idle. The WAR-blocked H2Ds for launches
-    # 1..N-1 are still pending on S_prep while kernel[0] runs.
+    # Poll S_prep immediately after each launch, with no device-to-host reads
+    # in the loop. With the tracker on, the correction H2D of launch k+1 is
+    # WAR-blocked behind kernel k, so S_prep is still busy right after the
+    # launch returns. query() returns True when the stream is idle.
     outs = []
-    for a, b in pairs:
+    busy_polls = 0
+    for k in range(num_launches):
+        a, b = pairs[k % len(pairs)]
         outs.append(compiled(a, b))
-
-    s_prep_idle_after_batch = s_prep.query()
+        if not s_prep.query():
+            busy_polls += 1
 
     torch.accelerator.synchronize(device)
     return {
         "tracker_enabled": _C.get_hazard_tracker_enabled(),
         "s_prep_id": s_prep.id(),
-        "s_prep_idle_after_batch": s_prep_idle_after_batch,
+        "num_polls": num_launches,
+        "s_prep_busy_polls": busy_polls,
     }
 
 
@@ -387,7 +391,7 @@ class TestSPrepRouting:
         )
 
     def test_tracker_on_queues_work_on_s_prep(self, shared_compile_cache):
-        """Tracker on: S_prep has pending work after the full batch is enqueued."""
+        """Tracker on: S_prep is busy right after at least one launch."""
         result = _run_in_child(
             _child_s_prep_queued_work,
             args=(),
@@ -397,9 +401,9 @@ class TestSPrepRouting:
         )
         assert result["tracker_enabled"] is True
         assert result["s_prep_id"] == 65
-        assert not result["s_prep_idle_after_batch"], (
-            "S_prep was idle after enqueuing the full batch with tracker on — "
-            "WAR-blocked H2Ds were not routed to it."
+        assert result["s_prep_busy_polls"] >= 1, (
+            f"S_prep was idle after all {result['num_polls']} launches with "
+            "tracker on — WAR-blocked H2Ds were not routed to it."
         )
 
     def test_tracker_off_leaves_s_prep_idle(self, shared_compile_cache):
@@ -412,9 +416,10 @@ class TestSPrepRouting:
             timeout=180.0,
         )
         assert result["tracker_enabled"] is False
-        assert result["s_prep_idle_after_batch"], (
-            "S_prep had pending work with the tracker off — steps were routed "
-            "to it despite the single-stream fallback."
+        assert result["s_prep_busy_polls"] == 0, (
+            f"S_prep was busy after {result['s_prep_busy_polls']}/"
+            f"{result['num_polls']} launches with tracker off — steps were "
+            "routed to it despite the single-stream fallback."
         )
 
 
