@@ -25,11 +25,11 @@ from torch.testing._internal.common_utils import TemporaryFileName
 
 import torch_spyre  # noqa: F401  # registers the backend
 
-# Device-bound shape so kernel duration >> host compute duration.
+# Device-bound shape: kernel time >> host compute time.
 _MM_M, _MM_K, _MM_N = 2048, 8192, 2048
 _MM_DTYPE = torch.float16
 _NUM_LAUNCHES = 12
-# Minimum share of launches after the first that must satisfy each overlap check.
+# Minimum share of launches (after the first) that must pass each overlap check.
 _MIN_RAN_AHEAD_FRACTION = 0.8
 _MIN_PARTLY_INSIDE_FRACTION = 0.5
 
@@ -110,11 +110,8 @@ def _ends_before(a: dict, b: dict) -> bool:
 
 @pytest.fixture(scope="module")
 def compiled_mm():
-    """Compile mm and warm up once; opens the device in the pytest process.
-
-    The profiler cannot span a process boundary, so unlike
-    test_split_execution.py this cannot use a child process.
-    """
+    """Compile and warm up mm once, in the pytest process (the profiler cannot
+    span processes)."""
     torch._dynamo.reset()
     torch.manual_seed(0)
     device = torch.device("spyre")
@@ -129,15 +126,11 @@ def compiled_mm():
 
 
 def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
-    """Run num_launches mm calls under the profiler.
+    """Run mm num_launches times under the profiler.
 
-    Returns "events" (profiler's calibrated timestamps, unadjusted),
-    "outputs", "refs", and "skew_us" (diagnostic only, not applied).
-
-    The profiler already emits calibrated timestamps via
-    FLEX_TIMESTAMP_CALIBRATION; subtracting an additional heuristic skew
-    (kernel_ts - launch_call_ts) would include real submission/queuing delay
-    and could create apparent overlap that does not exist in wall-clock time.
+    Returns "events" (calibrated timestamps, unadjusted), "outputs", "refs" and
+    "skew_us" (diagnostic only). No extra skew correction: it would absorb real
+    queuing delay and could fake overlap.
     """
     device = torch.device("spyre")
     torch.manual_seed(3)
@@ -159,8 +152,7 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
         ) as prof:
-            # No device-to-host reads in the loop: they would block each
-            # launch on the previous kernel and prevent any overlap.
+            # No device-to-host reads here: they would serialize the launches.
             outs = [compiled_fn(a_s, b_s) for a_s, b_s in pairs_spyre]
             torch.accelerator.synchronize(device)
 
@@ -171,7 +163,7 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     outputs_cpu = [out.cpu().float() for out in outs]
 
     raw_events = _complete_events(trace_data.get("traceEvents", []))
-    # Compute skew for diagnostic printing only; do not apply it to events.
+    # Skew is printed only, never applied to events.
     skew = _skew_us(raw_events)
 
     return {
@@ -185,12 +177,9 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
 def _print_overlap_counts(
     kernels: list[dict], hc_spans: list[dict]
 ) -> tuple[int, int, int]:
-    """Print per-launch overlap of HostCompute with earlier kernels.
+    """Print per-launch overlap; return (ran_ahead, partly_inside, launches).
 
-    Returns (ran_ahead, partly_inside, launches).  Both lists must be sorted by
-    ts.  ran_ahead counts launches m whose HostCompute ends before kernel m-1
-    ends; partly_inside counts launches whose HostCompute positively
-    intersects any earlier kernel.
+    Both lists must be sorted by ts.
     """
     num_spans = min(len(kernels), len(hc_spans))
     ran_ahead = partly_inside = 0
@@ -198,13 +187,13 @@ def _print_overlap_counts(
         hc_start = hc_spans[m]["ts"]
         hc_end = hc_start + hc_spans[m].get("dur", 0)
 
-        # Check non-blocking dispatch: HostCompute[m] finishes before kernel[m-1] ends.
+        # ran_ahead: HostCompute[m] ends before kernel[m-1] ends.
         k_prev_end = kernels[m - 1]["ts"] + kernels[m - 1].get("dur", 0)
         ahead = hc_end < k_prev_end
         if ahead:
             ran_ahead += 1
 
-        # Check genuine interval intersection against any in-flight preceding kernel.
+        # partly_inside: HostCompute[m] intersects any earlier kernel.
         overlapping_kernel_idx = None
         for j in range(m):
             k_start = kernels[j]["ts"]
@@ -245,39 +234,12 @@ def _print_overlap_counts(
 
 
 @pytest.mark.requires_spyre_profiler
-class TestOverlapDiagnostic:
-    """Report host/device overlap for whichever tracker mode the process runs in.
-
-    Asserts nothing: the tracker is latched at startup, so run this file once
-    per mode and compare the printed counts:
-        SPYRE_HAZARD_TRACKER=1 pytest ... -k overlap_diagnostic -s
-        SPYRE_HAZARD_TRACKER=0 pytest ... -k overlap_diagnostic -s
-    Similar counts with the tracker off mean the overlap check measures
-    host/device concurrency, not the split itself.
-    """
-
-    def test_overlap_diagnostic_for_current_tracker_mode(self, compiled_mm):
-        from torch_spyre import _C
-
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
-        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
-        hc_spans = sorted(_host_compute_spans(result["events"]), key=lambda e: e["ts"])
-        print(
-            f"\nOVERLAP_DIAGNOSTIC tracker_enabled={_C.get_hazard_tracker_enabled()}  "
-            f"kernels={len(kernels)}  hc_spans={len(hc_spans)}"
-        )
-        _print_overlap_counts(kernels, hc_spans)
-
-
-@pytest.mark.requires_spyre_profiler
 class TestSplitExecutionTrace:
-    """Trace-level checks for split-execution correctness (issue #2889).
+    """Trace checks for split execution (issue #2889).
 
-    Requires SPYRE_HAZARD_TRACKER=1, which is latched at runtime startup:
-        SPYRE_HAZARD_TRACKER=1 USE_SPYRE_PROFILER=1 pytest ...
-
+    Needs SPYRE_HAZARD_TRACKER=1 (latched at startup) and USE_SPYRE_PROFILER=1.
     Set FLEX_TIMESTAMP_CALIBRATION=always and FLEX_SKIP_TIMESTAMP_CALIBRATION=0
-    to move clock calibration to runtime startup and avoid per-session DMA stalls.
+    to avoid per-session DMA stalls.
     """
 
     @pytest.fixture(autouse=True)
@@ -290,35 +252,23 @@ class TestSplitExecutionTrace:
             )
 
     def test_host_compute_span_present(self, compiled_mm):
-        """launch::HostCompute CPU span appears in the trace with tracker on."""
+        """The launch::HostCompute CPU span is in the trace."""
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
         hc_spans = _host_compute_spans(result["events"])
         assert hc_spans, (
-            "No launch::HostCompute CPU spans found in the trace with tracker on.  "
-            "Either AIUPTI device events are missing (check USE_SPYRE_PROFILER=1), "
-            "or the span was removed (post-#3488): update this file accordingly."
+            "No launch::HostCompute spans in the trace: AIUPTI events are "
+            "missing (check USE_SPYRE_PROFILER=1) or the span was removed."
         )
 
     def test_host_compute_runs_ahead_of_kernel(self, compiled_mm):
-        """HostCompute for a later launch overlaps device compute of an earlier
-        kernel.
+        """HostCompute for later launches overlaps earlier kernels.
 
-        Overlap is defined as a positive interval intersection:
-            hc_start < k_end  AND  k_start < hc_end
-        meaning the two time windows genuinely share wall-clock time.
+        ran_ahead: HostCompute[m] ends before kernel[m-1] ends.
+        partly_inside: HostCompute[m] intersects an earlier kernel
+        (hc_start < k_end and k_start < hc_end).
 
-        In an asynchronous pipeline, the host queues launches fast (~10 µs
-        each) while the device executes kernels (~1300 µs each).  Initial
-        device launch latency (~60 µs) means early launches finish on the host
-        before kernel 0 starts on device, but subsequent launches (m >= 6)
-        execute HostCompute on the CPU while kernel 0 is actively executing on
-        the device.
-
-        ``ran_ahead`` verifies that HostCompute[m] finishes before the
-        preceding kernel ends (hc_end[m] < k_end[m-1]), proving non-blocking
-        asynchronous dispatch.
-        ``partly_inside`` verifies that HostCompute[m] genuinely overlaps an
-        in-flight device kernel in wall-clock time.
+        The counts are the same with the tracker off, so this checks
+        asynchronous dispatch, not the split itself.
         """
         result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
         kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
@@ -333,8 +283,7 @@ class TestSplitExecutionTrace:
             f"\nskew_us={result['skew_us']:.2f} (diagnostic only)  spans={num_spans - 1}"
         )
         ran_ahead, partly_inside, launches = _print_overlap_counts(kernels, hc_spans)
-        # Thresholds come from 10 serial runs on the device-bound shape:
-        # worst case ran_ahead=11/11 and partly_inside=7/11.
+        # Worst of 10 device runs: ran_ahead 11/11, partly_inside 7/11.
         min_ran_ahead = math.ceil(_MIN_RAN_AHEAD_FRACTION * launches)
         min_partly_inside = math.ceil(_MIN_PARTLY_INSIDE_FRACTION * launches)
         assert ran_ahead >= min_ran_ahead, (
@@ -431,11 +380,10 @@ class TestSplitExecutionTrace:
             )
 
     def test_reprofiled_window_after_calibration(self, compiled_mm):
-        """A second profiling session still produces valid device events.
+        """A second profiling session still yields valid kernel events.
 
-        Requires FLEX_TIMESTAMP_CALIBRATION=always and
-        FLEX_SKIP_TIMESTAMP_CALIBRATION=0 so the calibration stall happens at
-        runtime start, outside both sessions.
+        Needs FLEX_TIMESTAMP_CALIBRATION=always and
+        FLEX_SKIP_TIMESTAMP_CALIBRATION=0 (calibrate at startup, not in-session).
         """
         device = torch.device("spyre")
         torch.manual_seed(5)
