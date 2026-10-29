@@ -29,6 +29,9 @@ import torch_spyre  # noqa: F401  # registers the backend
 _MM_M, _MM_K, _MM_N = 2048, 8192, 2048
 _MM_DTYPE = torch.float16
 _NUM_LAUNCHES = 12
+# Minimum share of launches after the first that must satisfy each overlap check.
+_MIN_RAN_AHEAD_FRACTION = 0.8
+_MIN_PARTLY_INSIDE_FRACTION = 0.5
 
 
 def _complete_events(trace_events: list[dict]) -> list[dict]:
@@ -291,15 +294,20 @@ class TestSplitExecutionTrace:
             f"  → partly_inside={partly_inside}/{num_spans - 1}  "
             f"ran_ahead={ran_ahead}/{num_spans - 1}"
         )
-        assert ran_ahead >= 1, (
-            f"HostCompute never finished before the preceding kernel ended "
-            f"(ran_ahead=0/{num_spans - 1}); host prep is not running ahead "
-            f"of device compute."
+        # Thresholds come from 10 serial runs on the device-bound shape:
+        # worst case ran_ahead=11/11 and partly_inside=7/11.
+        launches = num_spans - 1
+        min_ran_ahead = math.ceil(_MIN_RAN_AHEAD_FRACTION * launches)
+        min_partly_inside = math.ceil(_MIN_PARTLY_INSIDE_FRACTION * launches)
+        assert ran_ahead >= min_ran_ahead, (
+            f"HostCompute finished before the preceding kernel ended for only "
+            f"{ran_ahead}/{launches} launches (need {min_ran_ahead}); host prep "
+            f"is not running ahead of device compute."
         )
-        assert partly_inside >= 1, (
-            f"HostCompute never overlapped any preceding in-flight kernel "
-            f"(partly_inside=0/{num_spans - 1}); host prep is not running "
-            f"concurrently with device compute."
+        assert partly_inside >= min_partly_inside, (
+            f"HostCompute overlapped a preceding in-flight kernel for only "
+            f"{partly_inside}/{launches} launches (need {min_partly_inside}); "
+            f"host prep is not running concurrently with device compute."
         )
 
     def test_raw_edge_kernel_after_h2d(self, compiled_mm):
